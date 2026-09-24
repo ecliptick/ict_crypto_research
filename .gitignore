@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+profile_default/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.tox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+.ruff_cache/
+
+# Logs and DB
+*.log
+*.sqlite
+*.db
+*.sqlite-journal
+*.db-wal
+*.db-shm
+
+# Data — this fork does NOT commit data
+data/*.parquet
+data/**/*.parquet
+
+# Generated artifacts
+notebooks/*.png
+notebooks/_*.png
+notebooks/_nb*_result_cache*
+scratch/
+
+# Local environment overrides
+.env
+.env.local
+.env.*.local
