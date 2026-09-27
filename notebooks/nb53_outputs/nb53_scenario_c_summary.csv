@@ -1,0 +1,2 @@
+scenario,n_trades,total_pnl_usd,ev_per_trade_usd,win_rate_pct,n_zones_canonical,n_zones_strict,zone_count_ratio_pct,delta_pnl_vs_baseline
+C_strict_wick,48,62.707682565544005,1.3064100534488334,29.166666666666668,11545,11545,100.0,-1.7434455997999976e-05

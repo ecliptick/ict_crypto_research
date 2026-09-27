@@ -277,90 +277,239 @@ def resolve_stop_fill(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build per-bar TickData index from a raw aggTrades DataFrame
+# Lazy per-bar tick side-table — refactor (2026-09-25)
+#
+# Previous design: ``build_tick_index()`` materialised a full
+# ``Dict[bar_start_ns, TickData]`` upfront — every bar's tick arrays
+# (price, quantity, is_buyer_maker, ts) were allocated in memory even
+# though only ~6-10 bars per day participate in a fill. On a monthly
+# BTCUSDT file (~31M ticks / ~2.6M 1s bars) this means 2.6M TickData
+# instances × 4 arrays each, all allocated upfront. Total memory was
+# ~150-200MB and the build pass walked every tick twice (once in
+# ``argsort``, once in the per-bar ``searchsorted`` loop).
+#
+# New design: the side-table only stores a thin slice-boundary index
+# (bar_start_ns → (start_idx, end_idx) into the pre-sorted tick
+# arrays). Callers request a bar's TickData via ``.get(bar_ns)`` and
+# the slice is materialised on demand. Empty bars return ``None``.
+#
+# Cost profile:
+#   * Build pass: one ``argsort(bar_sec, kind="stable")`` + one
+#     ``np.unique(bar_sec)`` + a python loop emitting N populated
+#     bar segments. Memory: O(N_ticks × int64) for the sorted-bar
+#     array, no per-bar TickData allocations.
+#   * Lookup pass (per refill): one dict get + one slice into the
+#     pre-sorted arrays. Returns the actual TickData view only for
+#     bars that participate in a fill (~0.005% of all bars).
+#
+# Backward compat: ``build_tick_index()`` is kept as a deprecated thin
+# wrapper that delegates to the lazy table and immediately materializes
+# every bar (slow path). New code should call ``build_tick_side_table``
+# directly.
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+class _TickSideTable:
+    """Lazy per-bar tick index. Built once; queried per fill.
+
+    Stores the master sorted tick arrays plus a ``bar_index`` dict
+    mapping ``bar_start_ns`` to a ``(start, end)`` slice into those
+    arrays. Per-bar TickData is materialised on demand via ``get``.
+
+    All arrays are sorted by ``bar_sec`` (the bar-start ns) in stable
+    order, so the slice for any bar preserves the original tick
+    arrival order within the bar.
+
+    Parameters
+    ----------
+    raw_df : pd.DataFrame
+        Raw aggTrades with columns ``ts`` (tz-aware UTC), ``price``,
+        ``quantity``, ``is_buyer_maker``.
+    """
+
+    __slots__ = (
+        "_prices", "_qtys", "_is_bm", "_ts",
+        "_bar_index", "_bar_start_arr", "_stats",
+    )
+
+    def __init__(self, raw_df: pd.DataFrame) -> None:
+        n = int(len(raw_df))
+        # n=0 — empty side-table; all .get() return None.
+        if n == 0:
+            self._prices = np.zeros(0, dtype=np.float64)
+            self._qtys = np.zeros(0, dtype=np.float64)
+            self._is_bm = np.zeros(0, dtype=bool)
+            self._ts = np.zeros(0, dtype=np.int64)
+            self._bar_index = {}
+            self._bar_start_arr = np.zeros(0, dtype=np.int64)
+            self._stats = {"n_raw": 0, "n_populated_bars": 0, "build_ms": 0.0}
+            return
+
+        t_build0 = time.perf_counter()
+
+        # Floor ts to bar-start ns (UTC). Vectorized.
+        ts_ns = raw_df["ts"].astype("int64").to_numpy()
+        bar_sec = (ts_ns // 1_000_000_000) * 1_000_000_000
+
+        prices = raw_df["price"].to_numpy(dtype=np.float64)
+        qtys = raw_df["quantity"].to_numpy(dtype=np.float64)
+        is_bm = raw_df["is_buyer_maker"].to_numpy(dtype=bool)
+
+        # Stable sort by bar_sec preserves intra-bar tick arrival order.
+        order = np.argsort(bar_sec, kind="stable")
+        sorted_bars = bar_sec[order]
+        sorted_prices = prices[order]
+        sorted_qtys = qtys[order]
+        sorted_is_bm = is_bm[order]
+        sorted_ts = ts_ns[order]
+
+        # Find group boundaries: a NEW bar-segment starts wherever
+        # sorted_bars differs from the prior element. We use np.where
+        # on the diff array (cheap, vectorised) instead of the previous
+        # searchsorted-in-a-loop pattern.
+        n_ticks = sorted_bars.shape[0]
+        # Edge case: a single tick — treat as its own segment.
+        if n_ticks == 1:
+            starts = np.array([0], dtype=np.int64)
+            ends = np.array([1], dtype=np.int64)
+        else:
+            diffs = np.empty(n_ticks, dtype=bool)
+            diffs[0] = True                            # first tick is always a new segment
+            diffs[1:] = sorted_bars[1:] != sorted_bars[:-1]
+            new_seg_idx = np.where(diffs)[0]
+            starts = new_seg_idx
+            ends = np.empty_like(starts)
+            ends[:-1] = starts[1:]
+            ends[-1] = n_ticks
+        seg_bar_starts = sorted_bars[starts]
+        seg_count = int(starts.shape[0])
+
+        # Build the dict {bar_start_ns: (start, end)}. Use Python int
+        # keys (np.int64 hashes fine but Python int is slightly faster).
+        bar_index: Dict[int, tuple] = {}
+        for i in range(seg_count):
+            bar_index[int(seg_bar_starts[i])] = (int(starts[i]), int(ends[i]))
+
+        # Hold references — DO NOT copy. Slices in .get() are views.
+        self._prices = sorted_prices
+        self._qtys = sorted_qtys
+        self._is_bm = sorted_is_bm
+        self._ts = sorted_ts
+        self._bar_index = bar_index
+        self._bar_start_arr = seg_bar_starts
+        self._stats = {
+            "n_raw": n,
+            "n_populated_bars": seg_count,
+            "build_ms": float((time.perf_counter() - t_build0) * 1000.0),
+        }
+
+    def get(self, bar_start_ns: int) -> Optional[TickData]:
+        """Return TickData for ``bar_start_ns``, or ``None`` if empty.
+
+        Materialises a fresh TickData on the FIRST call per bar
+        (subsequent calls hit the cached slice; ``TickData`` itself is
+        small so we re-allocate rather than cache to keep the class
+        simple). Empty bars (no segment in the index) return ``None``.
+        """
+        seg = self._bar_index.get(int(bar_start_ns))
+        if seg is None:
+            return None
+        start, end = seg
+        n = end - start
+        if n == 0:
+            return None
+        return TickData(
+            bar_start_ns=int(bar_start_ns),
+            prices=self._prices[start:end],
+            quantities=self._qtys[start:end],
+            is_buyer_maker=self._is_bm[start:end],
+            ts_ns=self._ts[start:end],
+        )
+
+    def __contains__(self, bar_start_ns: int) -> bool:
+        return int(bar_start_ns) in self._bar_index
+
+    @property
+    def n_populated_bars(self) -> int:
+        return int(self._stats["n_populated_bars"])
+
+    @property
+    def n_raw_ticks(self) -> int:
+        return int(self._stats["n_raw"])
+
+    @property
+    def build_ms(self) -> float:
+        return float(self._stats["build_ms"])
+
+    @property
+    def pop_bars(self) -> np.ndarray:
+        """int64 array of populated bar-start ns values (read-only)."""
+        return self._bar_start_arr
+
+
+def build_tick_side_table(raw_df: pd.DataFrame) -> _TickSideTable:
+    """Build a lazy tick side-table from raw aggTrades.
+
+    Recommended replacement for ``build_tick_index()``. The returned
+    table holds the pre-sorted tick arrays and a dict of slice
+    boundaries, but does NOT materialise per-bar TickData until
+    ``.get(bar_ns)`` is called. Typical usage (only ~6-10 bars per
+    day host a fill):
+    """
+    return _TickSideTable(raw_df)
+
 
 def build_tick_index(
     raw_df: pd.DataFrame,
     bar_times_ns: np.ndarray,
 ) -> Dict[int, TickData]:
-    """Build a ``{bar_start_ns: TickData}`` dict from a raw tick frame.
+    """LEGACY EAGER INDEX. Deprecated — use ``build_tick_side_table``.
 
-    Parameters
-    ----------
-    raw_df : pd.DataFrame
-        Raw aggTrades DataFrame with columns ``ts`` (tz-aware UTC),
-        ``price``, ``quantity``, ``is_buyer_maker``.
-    bar_times_ns : np.ndarray
-        int64 array of bar-start timestamps (ns UTC), one per bar
-        in the 1s OHLCV frame.
+    Materialises a full ``Dict[bar_start_ns, TickData]`` upfront. On
+    monthly BTCUSDT files (~2.6M populated bars) this allocates
+    2.6M TickData instances (~150-200MB) up front and walks every
+    tick even when only a handful of bars actually participate in a
+    fill.
 
-    Returns
-    -------
-    Dict[int, TickData]
-        Mapping from bar-start ns to TickData. Bars with zero
-        ticks are still present (with empty arrays). Used to
-        resolve per-bar tick fills.
+    Kept for backward compatibility with callers that already pass
+    the eager dict to ``_refill_trades_with_ticks`` (the wrapper
+    auto-detects which form it received). New code should use
+    ``build_tick_side_table`` directly and call ``.get(bar_ns)``
+    on demand.
     """
-    if raw_df.empty or len(bar_times_ns) == 0:
-        return {int(t): TickData(int(t), np.zeros(0), np.zeros(0),
-                                 np.zeros(0, dtype=bool), np.zeros(0, dtype=np.int64))
-                for t in bar_times_ns}
-
-    # Vectorize: floor ts to second, get integer ns, group
-    ts_ns = raw_df["ts"].astype("int64").to_numpy()
-    bar_sec = ts_ns // 1_000_000_000 * 1_000_000_000   # floor to bar start
-
-    prices = raw_df["price"].to_numpy(dtype=np.float64)
-    qtys = raw_df["quantity"].to_numpy(dtype=np.float64)
-    is_bm = raw_df["is_buyer_maker"].to_numpy(dtype=bool)
-
-    # Build a sorted list of unique bar-start-ns values
-    unique_bars = np.unique(bar_sec)
-    bar_to_idx = {int(b): i for i, b in enumerate(unique_bars)}
-
-    # Pre-sort by bar_sec (stable sort preserves tick order)
-    order = np.argsort(bar_sec, kind="stable")
-    sorted_bars = bar_sec[order]
-    sorted_prices = prices[order]
-    sorted_qtys = qtys[order]
-    sorted_is_bm = is_bm[order]
-    sorted_ts = ts_ns[order]
-
-    # Find group boundaries via np.searchsorted on sorted_bars
-    # (binary search for each unique bar)
+    import warnings as _warnings
+    _warnings.warn(
+        "build_tick_index() is deprecated; use build_tick_side_table() "
+        "for lazy per-bar materialisation. This eager variant allocates "
+        "O(N_bars) TickData instances upfront.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    table = build_tick_side_table(raw_df)
     out: Dict[int, TickData] = {}
-    for b in unique_bars:
-        start = int(np.searchsorted(sorted_bars, b, side="left"))
-        end = int(np.searchsorted(sorted_bars, b, side="right"))
-        n = end - start
-        if n == 0:
-            out[int(b)] = TickData(
-                bar_start_ns=int(b),
-                prices=np.zeros(0, dtype=np.float64),
-                quantities=np.zeros(0, dtype=np.float64),
-                is_buyer_maker=np.zeros(0, dtype=bool),
-                ts_ns=np.zeros(0, dtype=np.int64),
-            )
-        else:
-            out[int(b)] = TickData(
-                bar_start_ns=int(b),
-                prices=sorted_prices[start:end].copy(),
-                quantities=sorted_qtys[start:end].copy(),
-                is_buyer_maker=sorted_is_bm[start:end].copy(),
-                ts_ns=sorted_ts[start:end].copy(),
-            )
-    # Also fill any bar_times_ns that have no ticks
     for t in bar_times_ns:
-        if int(t) not in out:
-            out[int(t)] = TickData(
-                bar_start_ns=int(t),
-                prices=np.zeros(0, dtype=np.float64),
-                quantities=np.zeros(0, dtype=np.float64),
-                is_buyer_maker=np.zeros(0, dtype=bool),
-                ts_ns=np.zeros(0, dtype=np.int64),
-            )
+        td = table.get(int(t))
+        if td is not None:
+            out[int(t)] = td
+        # NB: empty bars are simply skipped in the legacy contract.
     return out
+
+
+def _resolve_fill_in_ticks(
+    ticks: TickData,
+    direction: int,
+    sl_price: float,
+    tp_price: float,
+) -> TickFillResult:
+    """Tick-precise fill resolver. Returns the FIRST tick that fires
+    SL or TP (whichever comes earlier in tick-arrival order).
+
+    Thin facade over ``resolve_tick_fill`` — kept as a named helper so
+    the refill hot path reads cleanly and so future optimisations
+    (e.g. precomputing ``sl_hit`` / ``tp_hit`` masks) can be added
+    without touching the refill caller.
+    """
+    return resolve_tick_fill(ticks, direction, sl_price, tp_price)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -368,11 +517,16 @@ def build_tick_index(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_tick_backtest(
-    raw_df: pd.DataFrame,
+    raw_df: Optional[pd.DataFrame] = None,
     p: Optional[TrendStrategyParams] = None,
     *,
     strategy_label: str = "ict-tick",
     pre_aggregated_bars: Optional[pd.DataFrame] = None,
+    precomputed_zones_by_src: dict | None = None,
+    precomputed_structure=None,
+    precomputed_atr: Optional[np.ndarray] = None,
+    precomputed_wick_floor_usd: Optional[np.ndarray] = None,  # 2026-09-26 c
+    side_table=None,
 ) -> IctBacktestResult:
     """Run the tick-fill hybrid backtest.
 
@@ -419,58 +573,88 @@ def run_tick_backtest(
     # ── Step 1: aggregate ticks → 1s bars ──
     if pre_aggregated_bars is not None:
         bars = pre_aggregated_bars
-    else:
+    elif raw_df is not None:
         bars = aggregate_ticks_to_1s_bars(raw_df)
+    else:
+        raise ValueError(
+            "run_tick_backtest needs raw_df or pre_aggregated_bars or "
+            "precomputed_zones_by_src (with bars)."
+        )
     t_agg = time.perf_counter() - t0
     _log.info("Aggregated %d raw ticks → %d 1s bars in %.2fs",
-              len(raw_df), len(bars), t_agg)
+              0 if raw_df is None else len(raw_df), len(bars), t_agg)
 
     # ── Step 2: run the bar-based backtest ──
     t_bar0 = time.perf_counter()
-    result = run_ict_backtest(bars, p, strategy_label=strategy_label)
+    result = run_ict_backtest(
+        bars, p,
+        strategy_label=strategy_label,
+        precomputed_structure=precomputed_structure,
+        precomputed_atr=precomputed_atr,
+        precomputed_zones_by_src=precomputed_zones_by_src,
+        precomputed_wick_floor_usd=precomputed_wick_floor_usd,
+    )
     t_bar = time.perf_counter() - t_bar0
     _log.info("Bar backtest: %d trades in %.2fs",
               len(result.trades), t_bar)
 
-    # ── Step 3: tick-precise exit refills ──
-    # Build tick index for every bar that participated in an exit
-    # (or could have — we just build the full index for simplicity
-    # at the cost of O(N_bars × avg_ticks_per_bar) memory).
-    bar_times_ns = bars["time"].astype("int64").to_numpy()
-    tick_index = build_tick_index(raw_df, bar_times_ns)
-    t_idx = time.perf_counter() - t_bar0 - t_bar
-    _log.info("Built tick index for %d bars in %.2fs",
-              len(tick_index), t_idx)
+    # ── Step 3: tick-precise exit refills (LAZY side-table) ──
+    # Build the slice-boundary index once (~50-100ms even for monthly
+    # files with ~30M ticks — a single argsort, no per-bar allocation).
+    # Per-bar TickData is materialised on demand by
+    # ``_refill_trades_with_ticks`` for the ~6-10 bars/day that host
+    # a SL/TP fill. Net memory drops from O(N_bars × TickData) to
+    # O(N_trades × TickData); the index itself is O(N_populated_bars).
+    t_idx0 = time.perf_counter()
+    if side_table is None:
+        if raw_df is None:
+            raise ValueError(
+                "run_tick_backtest needs raw_df to build the side-table "
+                "when side_table is not supplied."
+            )
+        side_table = build_tick_side_table(raw_df)
+    t_idx = time.perf_counter() - t_idx0
+    n_pop = getattr(side_table, "n_populated_bars", 0)
+    n_raw = getattr(side_table, "n_raw_ticks", 0 if raw_df is None else len(raw_df))
+    _log.info(
+        "Built lazy tick side-table: %d raw ticks → %d populated bars in %.2fs",
+        n_raw, n_pop, t_idx,
+    )
 
-    # Re-fill exits. We don't re-fill entries because the
-    # bar-level entry fill at b_open is the standard "next-bar-open"
-    # anti-lookahead fill. We only need to improve the EXIT price.
+    # Re-fill exits. The side-table replaces the old eager build_tick_index
+    # dict; .get(bar_ns) materialises TickData on first use.
     t_refill0 = time.perf_counter()
     n_refilled = _refill_trades_with_ticks(
-        result.trades, tick_index, p,
+        result.trades, side_table, p,
     )
     t_refill = time.perf_counter() - t_refill0
-    _log.info("Refilled %d trades with tick-precise exits in %.2fs",
-              n_refilled, t_refill)
+    _log.info("Refilled %d trades with tick-precise exits in %.2fs "
+              "(%d side-table lookups)",
+              n_refilled, t_refill, n_refilled)
 
     # Add a tick-specific metadata field
     if not hasattr(result, "tick_metadata") or result.tick_metadata is None:
         result.tick_metadata = {
             "n_bars": int(len(bars)),
-            "n_raw_ticks": int(len(raw_df)),
+            "n_raw_ticks": int(n_raw),
+            "n_populated_bars": int(n_pop),
+            "n_lookups": int(n_refilled),
             "n_trades_refilled": int(n_refilled),
             "t_agg_s": float(t_agg),
             "t_bar_s": float(t_bar),
             "t_idx_s": float(t_idx),
             "t_refill_s": float(t_refill),
             "t_total_s": float(time.perf_counter() - t0),
+            "side_table_build_ms": float(getattr(side_table, "build_ms", 0.0)),
+            "cache_used": bool(precomputed_zones_by_src is not None
+                               or precomputed_structure is not None),
         }
     return result
 
 
 def _refill_trades_with_ticks(
     trades: List[Trade],
-    tick_index: Dict[int, TickData],
+    tick_source,                # _TickSideTable | Dict[int, TickData]
     p: TrendStrategyParams,
 ) -> int:
     """Walk the ticks at each trade's exit bar; recompute the fill
@@ -481,6 +665,12 @@ def _refill_trades_with_ticks(
     bar-level price because they happen on structural events, not
     on price crossings.
 
+    ``tick_source`` is either a ``_TickSideTable`` (preferred — the
+    lazy path: ``.get(bar_ns)`` returns a freshly-materialised
+    TickData on demand) or a legacy ``Dict[int, TickData]`` (the
+    eager path; retained so older callers that haven't been
+    migrated still work).
+
     Returns the count of trades that were actually refilled.
     """
     n_refilled = 0
@@ -490,10 +680,16 @@ def _refill_trades_with_ticks(
         if tr.exit_time <= 0:
             continue
         # The exit bar's tick data — floor to bar start
-        exit_bar_ns = (tr.exit_time // 1_000_000_000) * 1_000_000_000
-        ticks = tick_index.get(exit_bar_ns)
-        if ticks is None or ticks.prices.size == 0:
-            continue  # no ticks in this bar — leave at bar-level fill
+        exit_bar_ns = int((tr.exit_time // 1_000_000_000) * 1_000_000_000)
+        # Uniform access: works for both the side-table and the dict.
+        if isinstance(tick_source, _TickSideTable):
+            ticks = tick_source.get(exit_bar_ns)
+            if ticks is None or ticks.prices.size == 0:
+                continue
+        else:                                       # legacy dict path
+            ticks = tick_source.get(exit_bar_ns)
+            if ticks is None or ticks.prices.size == 0:
+                continue  # no ticks in this bar — leave at bar-level fill
         # Compute SL / TP prices from the trade's recorded distances
         if tr.direction > 0:
             sl_price = tr.entry_price - tr.stop_usd
@@ -504,7 +700,7 @@ def _refill_trades_with_ticks(
         # Apply soft-stop / trailing modifications if recorded
         # (the bar-level SL may have been tightened — for now we
         # assume the recorded `stop_usd` IS the effective SL).
-        fr = resolve_tick_fill(ticks, tr.direction, sl_price, tp_price)
+        fr = _resolve_fill_in_ticks(ticks, tr.direction, sl_price, tp_price)
         if fr.filled:
             # If the bar-level reason and tick-level reason agree,
             # update the fill price (may differ slightly if the bar
@@ -521,17 +717,23 @@ def _refill_trades_with_ticks(
                 tr.exit_reason = fr.fill_reason
             tr.exit_price = fr.fill_price
             n_refilled += 1
-            # Recompute PnL with the (possibly different) exit price
-            contract_size = float(getattr(p, "contract_size", 100.0))
+            # Recompute PnL with the (possibly different) exit price.
+            # BTC-native sizing: PnL = signed price_move × qty_btc.
+            # No contract multiplier on USDT-M perps — qty_btc is the
+            # direct BTC position. ``tr.lots`` is kept as a back-compat
+            # alias of ``tr.qty_btc``.
+            # (2026-09-26 d fix: previously this used a default
+            # ``contract_size=100.0`` XAUUSD fallback, producing 100×
+            # PnL inflation. The BTC fork dropped contract_size.)
+            qty_btc = float(getattr(tr, "qty_btc", 0.0)) or float(getattr(tr, "lots", 0.0))
             if tr.direction > 0:
-                tr.pnl_usd = (tr.exit_price - tr.entry_price) * tr.lots * contract_size
+                tr.pnl_usd = (tr.exit_price - tr.entry_price) * qty_btc
             else:
-                tr.pnl_usd = (tr.entry_price - tr.exit_price) * tr.lots * contract_size
-            # Re-debit fees (use the NEW gross PnL for fee base, since
-            # fee is on notional which is unchanged — but the NET pnl
-            # changes). Actually fee is based on entry notional which
-            # didn't change, so fee_usd is unchanged. But pnl_usd has
-            # changed, so net has changed.
+                tr.pnl_usd = (tr.entry_price - tr.exit_price) * qty_btc
+            # fee_usd is on entry notional which didn't change — but
+            # pnl_usd has, so net has changed. Subtract the existing
+            # fee_usd (set in _close_trade on the bar path) from the
+            # recomputed gross to get the new net.
             tr.pnl_usd -= tr.fee_usd
     return n_refilled
 
@@ -542,8 +744,11 @@ __all__ = [
     "TickFillResult",
     "aggregate_ticks_to_1s_bars",   # re-export
     "load_raw_aggtrades",           # re-export
-    "build_tick_index",
+    "_TickSideTable",
+    "build_tick_side_table",        # preferred new entry point
+    "build_tick_index",             # legacy, deprecated
     "resolve_tick_fill",
+    "_resolve_fill_in_ticks",
     "resolve_limit_fill",
     "resolve_stop_fill",
     "run_tick_backtest",

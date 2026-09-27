@@ -1,0 +1,2 @@
+scenario,best_min_zone_usd,best_total_pnl_usd,best_ev_per_trade,best_n_trades,canonical_pnl_usd,delta_pnl_vs_baseline
+F_zone_breadth_sweep,20.0,75.5584345655473,2.9060936371364345,26,62.707682565544005,12.850752000003297

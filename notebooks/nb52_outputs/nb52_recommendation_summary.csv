@@ -1,0 +1,2 @@
+scope_files,n_trades,total_pnl_usd,ev_per_trade_usd,win_rate_pct,f1_fresh_ev_usd,f1_fresh_n,f1_cold_ev_usd,f1_cold_n,f2_reclaim_ev_usd,f2_reclaim_n,f3_true_ifvg_ev_usd,f3_fvg_invalidated_ev_usd,skipped_sweep,best_sl,best_tp,canonical_sl,canonical_tp,out_dir
+BTCUSDT-aggTrades-2025-04.parquet,25,164.12039456554874,6.56481578262195,44.0,,0,7.29080132893692,23,,0,1.4486231423216587,10.584681428572178,True,,,2.0,22.0,C:\coding\ict_crypto_research\notebooks\nb52_outputs

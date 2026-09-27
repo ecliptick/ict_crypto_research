@@ -1,0 +1,2 @@
+scenario,best_dist_bars,best_pnl,canonical_pnl,delta_pnl_vs_baseline
+D_mit_distance_sweep,1,62.707682565544005,62.707682565544005,0.0

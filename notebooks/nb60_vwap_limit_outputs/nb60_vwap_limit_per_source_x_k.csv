@@ -1,0 +1,11 @@
+source,k_sigma,n_trades,win_rate_pct,pnl_net_usd,ev_per_trade_usd,median_hold_secs
+vwap_initial,0.3,134,33.58,207.5654,1.549,7166.0
+vwap_initial,0.5,117,31.62,179.064,1.5305,4820.0
+vwap_initial,0.7,108,35.19,170.1211,1.5752,7190.5
+vwap_initial,1.0,84,28.57,104.9442,1.2493,5385.0
+vwap_initial,1.5,46,23.91,33.689,0.7324,4275.0
+vwap_inversion_flip,0.3,121,23.14,116.5865,0.9635,2776.0
+vwap_inversion_flip,0.5,118,22.03,98.8801,0.838,2971.5
+vwap_inversion_flip,0.7,109,20.18,99.0486,0.9087,3370.0
+vwap_inversion_flip,1.0,99,21.21,88.6104,0.8951,3694.0
+vwap_inversion_flip,1.5,69,17.39,47.6714,0.6909,3978.0

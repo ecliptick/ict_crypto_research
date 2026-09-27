@@ -1,0 +1,2 @@
+n_files,n_files_new_wins,n_files_old_wins,n_files_flat,sum_pnl_old_usd,sum_pnl_new_usd,sum_delta_pnl_usd,mean_pnl_old_usd,mean_pnl_new_usd,mean_delta_pnl_usd,mean_ev_old_usd,mean_ev_new_usd,mean_wr_old_pct,mean_wr_new_pct,total_trades_old,total_trades_new,total_tp_old,total_tp_new,total_sl_old,total_sl_new,total_inv_old,total_inv_new
+6,2,4,0,319.98267265633746,310.718430656336,-9.26424200000155,53.33044544272291,51.786405109389335,-1.5440403333335917,1.0111280777762277,1.043681922669548,27.417108696398532,27.737380195820094,287,273,82,78,89,86,113,106

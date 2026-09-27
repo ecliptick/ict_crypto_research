@@ -1,0 +1,9 @@
+,n_orders_filled,n_orders_filled,n_orders_filled,n_orders_filled,n_orders_filled,n_orders_filled,n_trades,n_trades,n_trades,n_trades,n_trades,n_trades,pnl_net_usd,pnl_net_usd,pnl_net_usd,pnl_net_usd,pnl_net_usd,pnl_net_usd,win_rate_pct,win_rate_pct,win_rate_pct,win_rate_pct,win_rate_pct,win_rate_pct
+month,2025-04,2025-05,2025-10,2025-11,2026-02,2026-05,2025-04,2025-05,2025-10,2025-11,2026-02,2026-05,2025-04,2025-05,2025-10,2025-11,2026-02,2026-05,2025-04,2025-05,2025-10,2025-11,2026-02,2026-05
+n_orders_placed,,,,,,,,,,,,,,,,,,,,,,,,
+1220,,,,,,32.0,,,,,,32.0,,,,,,7.53,,,,,,31.25
+1620,,26.0,,,,,,26.0,,,,,,21.12,,,,,,38.46,,,,
+1960,,,,,69.0,,,,,,69.0,,,,,,27.75,,,,,,23.19,
+2090,67.0,,,,,,67.0,,,,,,38.24,,,,,,23.88,,,,,
+2110,,,47.0,,,,,,47.0,,,,,,-5.21,,,,,,8.51,,,
+3030,,,,88.0,,,,,,88.0,,,,,,12.06,,,,,,13.64,,

@@ -1,0 +1,2 @@
+scenario,n_trades,bull_count_above_max,bull_count_above_mean,bear_count_below_max,bear_count_below_mean,top_decile_conv_mean_pnl,bottom_decile_conv_mean_pnl
+G_conviction_unsuperseded_fvgs,48,30,4.7224862914402586,23,3.854060502373472,-1.206582799999977,-1.1772888000000232

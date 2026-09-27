@@ -75,15 +75,15 @@ class TrendStrategyParams:
     # here only matter when ``use_atr_scaling=False`` is set explicitly.
     sl_usd: float = 20.0               # BTC scale: $20 vs gold $0.80
     tp_usd: float = 200.0              # BTC scale: $200 vs gold $1.80
-    lots: float = 0.01
-    # Contract multiplier: 1.0 lot × 1.0 unit × this = PnL per $1 price move.
-    # Default 100.0 = XAUUSD (1 lot = 100 oz, $1 move = $100/lot).
-    # For BTC at Binance perps the canonical recipe uses
-    # ``contract_size=1.0`` (1 contract = 1 BTC, so 0.01 lots × $1 BTC
-    # move = $0.01 PnL). To get $1 PnL per $1 BTC move (1 lot = 1 BTC
-    # exactly) use ``lots=1.0, contract_size=1.0``. For BTC micro-lots
-    # where 1 lot = 0.001 BTC use ``lots=0.01, contract_size=0.001``.
-    contract_size: float = 1.0
+    # ── Position size (BTC-native, added 2026-09-26) ─────────────
+    # Direct BTC quantity per trade layer. On Binance USDT-M perps
+    # there is no contract multiplier — 1 contract IS 1 BTC, and
+    # position size is just BTC quantity. Notional at fill = qty_btc
+    # × entry_price. Fee is debited as notional × taker_bps × 2 sides.
+    # Default 0.001 BTC ≈ $80 notional at BTC=$80k; matches a
+    # small-account micro-lot sizing for the canonical recipe.
+    # PnL = signed price move × qty_btc (no multiplier).
+    qty_btc: float = 0.001
     entry_on: str = "open"            # "open" | "close"
     exit_on: str = "close"            # SL/TP touch evaluated against bar high/low
     # ── Entry mode (added 2026-09-17, v6+ Innovation #1) ───────────────
@@ -96,8 +96,17 @@ class TrendStrategyParams:
     #   is tradeable (nb39 finding, INV_TRADE config replicates this
     #   on a clean corpus). Sniper mode SKIPS the loss-making original
     #   trade entirely and only takes the positive-EV reversal.
-    # Default OFF ("immediate") — switch on via A/B; only fires for
-    # FVG/iFVG sources (ORB / Wyckoff / sweep are unaffected).
+    # "dual" — fire BOTH paths on every FVG/iFVG signal. The
+    #   immediate ladder enters on first mitigation (original
+    #   direction); the sniper waits for inversion and enters on
+    #   the iFVG (continuation/fade direction). The two paths
+    #   target different events on the same zone (mit vs inv) and
+    #   produce disjoint trade sets per zone. Doubles trade
+    #   frequency on zones that both mitigate AND invert within
+    #   the sniper age cap; single-fire on zones that only
+    #   mitigate (immediate path) or only invert (sniper path).
+    #   Default OFF ("immediate") — switch on via A/B; only fires
+    #   for FVG/iFVG sources (ORB / Wyckoff / sweep are unaffected).
     entry_mode: str = "immediate"
 
     # ── Signal source selection ───────────────────────────────────────
@@ -138,6 +147,53 @@ class TrendStrategyParams:
     fvg_tp_per_breadth: float = 0.0    # 0=use tp_usd; else TP = k * zone_width
     fvg_sl_breadth_invert: bool = False  # invert semantics for SL
     fvg_tp_breadth_invert: bool = False  # invert semantics for TP
+    # ── Immediate-mode SL/TP mode selector (added 2026-09-26 d) ─────────
+    # Parallel to ``sniper_sl_mode`` / ``sniper_tp_mode``. Drives the
+    # non-sniper (``entry_mode='immediate'``) signal path so the
+    # immediate entry can pick SL/TP from any of three regimes:
+    #   * "usd_fixed"  — fixed USD (``sl_usd``/``tp_usd``).
+    #   * "atr_mult"   — regime-adaptive (sl_atr_mult*ATR, tp_atr_mult*ATR).
+    #   * "zone_mult"  — zone-anchored (immediate_sl_zone_mult*zone_width,
+    #                     immediate_tp_zone_mult*zone_width), fed through
+    #                     the existing ``fvg_sl_per_breadth`` /
+    #                     ``fvg_tp_per_breadth`` breath path so the FVG
+    #                     iFVG breath-scaling code picks them up
+    #                     transparently.
+    # Defaults preserve the pre-26d behaviour: "usd_fixed" if
+    # use_atr_scaling is False (the legacy BTC default); "atr_mult"
+    # if use_atr_scaling is True. The new keys only take effect when
+    # the user explicitly opts in via ``optimal_params(..., immediate_sl_mode=...)``.
+    immediate_sl_mode: str = ""   # "" = inherit from use_atr_scaling
+    immediate_tp_mode: str = ""   # "" = inherit from use_atr_scaling
+    immediate_sl_zone_mult: float = 0.0   # only used if immediate_sl_mode == "zone_mult"
+    immediate_tp_zone_mult: float = 0.0   # only used if immediate_tp_mode == "zone_mult"
+    # When True, the new mode selectors apply to BOTH the sniper and
+    # the immediate path. Default off — sniper keeps its own dedicated
+    # knobs (sniper_sl_mode, sniper_tp_mode) for back-compat.
+    sxt_share_mode_with_immediate: bool = False
+    # ── Conviction-aware SL/TP widening on the immediate ladder (nb57) ──
+    # The immediate-ladder path submits N layers per signal at
+    # ``compute_layer_sl_tp``-derived SL/TP. ``sig.conviction`` is the
+    # pre-existing structural scalar (1.0 = neutral, up to ~1.5 for a
+    # fresh BoS/CHoCH+ in the trade direction). These knobs use
+    # conviction to widen the SL/TP post-hoc, so high-conviction
+    # trades get more room to ride the structural move and low-
+    # conviction trades are not penalized further.
+    #
+    # Formula (when widen > 0 and cv > 1.0):
+    #   scaled_sl *= 1.0 + (cv - 1.0) * widen_sl
+    #   scaled_tp *= 1.0 + (cv - 1.0) * widen_tp
+    #
+    # Defaults are identity (1.0) so canonical behavior is bit-identical.
+    ladder_conviction_sl_widen: float = 1.0
+    ladder_conviction_tp_widen: float = 1.0
+    # Optional conviction floor: skip the layer entirely when
+    # ``sig.conviction < ladder_min_conviction``. Default 0.0 (off).
+    ladder_min_conviction: float = 0.0
+    # Cap on num_layers used by the immediate-ladder path. With
+    # default 3, all layers fire; setting to 1 drops the two
+    # innermost layers (which structurally SL-hunt same-bar).
+    ladder_num_layers_max: int = 3
     drop_inverted_fvg: bool = True     # FVG path drops zones that are already inverted
     # ── FVG supersession on new-zone-in-range (added 2026-08-20) ──────────
     # When a NEW FVG's [zone_low, zone_high] overlaps an existing live
@@ -725,6 +781,45 @@ class TrendStrategyParams:
     fvg_inv_trade_tp_atr_mult: float = 0.0   # 0=disabled; >0 = use ATR scaling
     fvg_inv_trade_min_zone_usd: float = 0.30
     fvg_inv_trade_max_per_zone: int = 1
+    # ── SL/TP sizing mode for the sniper path (added 2026-09-26, c) ────
+    # Independent toggles for SL and TP sizing. Each can be:
+    #   * ``"zone_mult"``  — size = zone_w × fvg_inv_trade_sl_zone_mult
+    #                         (or tp_zone_mult). Default for both.
+    #   * ``"atr_mult"``   — size = ATR_at_entry_bar × fvg_inv_trade_sl_atr_mult
+    #                         (or tp_atr_mult). ATR-anchored = regime-adaptive.
+    # Two knobs because SL and TP have independent R:R roles — a
+    # regime-adaptive SL with a zone-anchored TP is a sensible combo.
+    # The legacy ``fvg_inv_trade_tp_atr_mult > 0`` path is honoured as
+    # "atr_mult" if ``sniper_tp_mode == "zone_mult"`` (default) — the
+    # legacy behaviour stays bit-identical until the user opts into the
+    # new mode explicitly.
+    sniper_sl_mode: str = "zone_mult"   # "zone_mult" | "atr_mult"
+    sniper_tp_mode: str = "zone_mult"   # "zone_mult" | "atr_mult"
+    # Companion ATR mults (only used when the matching mode == "atr_mult").
+    # Defaults match the canonical ``sl_atr_mult=0.25`` / ``tp_atr_mult=0.55``.
+    fvg_inv_trade_sl_atr_mult: float = 0.25
+    fvg_inv_trade_tp_atr_mult_v2: float = 0.55  # 2026-09-26 c: separate from
+                                                # the legacy tp_atr_mult knob
+    # ── Mitigation-distance filter (added 2026-09-26, nb53 alpha) ─────
+    # Only emit a retest signal if the zone's mitigation / inversion
+    # bar is at least ``fvg_min_mit_distance_bars`` away from the
+    # trigger bar. A 1-bar-apart mitigation is a drive-through, not
+    # a meaningful fill — it produces a "mitigated" tag but no real
+    # commitment to the inverted side. Setting this to 3 (or higher)
+    # filters drive-throughs and keeps only zones that took real
+    # time to fill. ``0`` = no distance filter (legacy behaviour).
+    fvg_min_mit_distance_bars: int = 0
+    # ── Strict-wick FVG detection (added 2026-09-26, nb53 alpha) ─────
+    # When True, only emit an FVG if BOTH outer candles have a visible
+    # wick (their non-gap extreme is at least
+    # ``fvg_strict_wick_min_wick_usd`` USD away from their respective
+    # body). Default False — preserves the canonical detector which
+    # only checks for the gap (c1.H < c3.L for bull), regardless of
+    # wick visibility. nb53 alpha Scenario C explores whether
+    # "non-wicked candles" (where c1 or c3 are essentially flat-body)
+    # produce noisier zones.
+    fvg_strict_wick_required: bool = False
+    fvg_strict_wick_min_wick_usd: float = 0.0
     # ── Sniper-in mode age cap (added 2026-09-17, v6+ Innovation #1) ─────
     # When ``entry_mode="sniper"``, pending sniper layers that have NOT
     # been triggered (zone not yet inverted) within this many wall-clock
@@ -732,6 +827,103 @@ class TrendStrategyParams:
     # cap without inverting is a "level that held" — its iFVG reversal
     # is unlikely now. Drop the stale sniper. ``0`` = unlimited.
     sniper_max_age_secs: int = 1800
+    # ── Sniper direction on inversion (added 2026-09-26, nb53 alpha;
+    #    renamed to enum 2026-09-26) ───────────────────────────────
+    # The sniper waits for the FVG zone to be inverted, then opens a
+    # trade. This knob controls which way that trade goes:
+    #
+    #   "continuation"      (canonical, default — preserves v17 BTC SNIPER)
+    #     Enter in the SAME direction as the original FVG's gap
+    #     polarity. The inversion is treated as a liquidity sweep
+    #     that the original displacement thesis survives; the sniper
+    #     is "patient" and rides the move after the shakeout.
+    #
+    #   "fade_displacement" (legacy-live-equivalent)
+    #     Enter OPPOSITE the original FVG's gap polarity. The
+    #     inversion is treated as a failed breakout; the sniper
+    #     fades the original move.
+    #
+    # Mathematically: with the scanner's iFVG direction already
+    # carrying one flip (-z.direction), the backtest computes
+    #   inv_dir_continuation      = -sp["direction"]
+    #   inv_dir_fade_displacement = -inv_dir_continuation
+    #                             = +sp["direction"]
+    #
+    # **Live engine divergence (2026-09-26)**: the live engine in
+    # the sibling ``ict_sniper_live`` repo currently implements
+    # ``fade_displacement`` semantics (it stores ``direction =
+    # z.direction`` at submit, then flips once on fire). The
+    # canonical backtest recipe defaults to ``continuation`` to
+    # match the parent ``ict_tier_v2`` v17 SNIPER full-corpus
+    # validation. The two paths WILL disagree on the same setup
+    # until the live engine is rewired — see AGENTS.md § "Sniper
+    # direction on inversion" for the divergence table and the
+    # planned reconciliation.
+    sniper_inv_direction_mode: str = "continuation"
+
+    # ── Strict-wick FVG filter (added 2026-09-26, BTC v17 SNIPER c) ─
+    # When ``strict_wick_required=True`` AND
+    # ``strict_wick_min_wick_price_pct > 0``, the detector requires
+    # both outer candles (c1 and c3) to have a visible wick on the
+    # side AWAY from the gap. The required wick length is
+    # ``strict_wick_min_wick_price_pct × mid_price_at_zone_trigger``,
+    # where mid_price is the rolling hourly median of the close
+    # recomputed at ``strict_wick_recompute_secs`` (default 3600s).
+    # A bar that opens inside the zone and closes outside still
+    # counts (body crosses); a bar that closes inside but opened
+    # outside is rejected (only wick touched).
+    #
+    # Default values: 0.025% of mid-price, hourly recompute.
+    # At BTC=$100k → $25 floor; at BTC=$30k → $7.50 floor. Keeps
+    # the filter price-relative without per-bar recompute cost.
+    strict_wick_required: bool = True
+    strict_wick_min_wick_price_pct: float = 0.00025  # 0.025% of mid-price
+    strict_wick_recompute_secs: int = 3600          # hourly bucket
+
+    # ── "Clean" zone gates (added 2026-09-26, BTC v17 SNIPER c) ──────
+    # A zone is considered "clean" / "organic" iff both its mitigation
+    # and inversion events occur at least N 1-second bars AFTER the
+    # zone's trigger bar. Zones that get mitigated/inverted within
+    # 1-2 bars of formation are treated as "drive-through" noise
+    # (immediate single-tick pierce followed by quick re-entry) and
+    # the sniper path is the appropriate response.
+    #
+    # When a zone's entry triggers (via the iFVG retest scanner) and
+    # BOTH ``mitigated_bar - trigger_bar >= fvg_min_mit_distance_bars``
+    # AND ``inverted_bar - trigger_bar >= fvg_min_inv_distance_bars``,
+    # the bar loop routes the entry to the NON-sniper ("normal")
+    # path — immediate entry at next-bar open, ATR-anchored SL/TP.
+    # Otherwise the sniper path runs (deferred entry, zone-anchored
+    # SL/TP). Both paths are evaluated on every triggered zone; the
+    # routing decision is per-zone, made at entry-bar time.
+    fvg_min_mit_distance_bars: int = 3
+    fvg_min_inv_distance_bars: int = 3
+    # ── Routing-floor overrides (added 2026-09-26, nb56) ───────────
+    # The clean-path / dirty-path routing decision in the bar loop
+    # uses the same ``fvg_min_*_distance_bars`` knobs as the detector
+    # by default. These knobs override ONLY the bar-loop routing
+    # floor — the detector keeps using ``fvg_min_*_distance_bars`` so
+    # the SweepCache fingerprint is unaffected (no cache rebuild on
+    # override). ``None`` (default) ⇒ fall through to the canonical
+    # detector floor. Set to an explicit integer to force the
+    # routing decision in isolation from detection.
+    #
+    # Usage: ``optimal_params(fvg_route_min_mit_distance_bars=0)``
+    # routes every zone to the clean (immediate) path; the value 0
+    # disables the clean gate in the bar loop only. ``...=1_000_000``
+    # routes every zone to the dirty (sniper) path.
+    fvg_route_min_mit_distance_bars: int | None = None
+    fvg_route_min_inv_distance_bars: int | None = None
+
+    # ── DEPRECATED: sniper_flip_direction (added 2026-09-26, kept
+    #    until 2026-12-31 as a back-compat shim) ─────────────────────
+    # The boolean ``sniper_flip_direction=True`` mapped to the new
+    # ``sniper_inv_direction_mode="fade_displacement"`` semantics. New
+    # code should use the enum directly. The bool is honoured here
+    # only by ``__post_init__`` so old ``optimal_params(...,
+    # sniper_flip_direction=True)`` calls keep working until the
+    # callers are migrated.
+    sniper_flip_direction: bool = False
 
     # ── Cooldown after a losing streak (kept from parent) ─────────────
     cooldown_bars: int = 0
@@ -786,6 +978,15 @@ class TrendStrategyParams:
     # order: the FIRST event sets the initial thesis, each
     # subsequent CHoCH flips it. BoS continues the prior thesis.
     bos_choch_memory_n_events: int = 5
+    # ── Structural-alpha gate (added 2026-09-26, vBTC3 finding) ──────
+    # Drop signals whose direction doesn't agree with the structure
+    # trend at the trigger bar. Validated on the 6-month BTC sample:
+    #   baseline (no gate): n=346 sum=$+624.20 EV=$+1.8041 WR=15.9%
+    #   trend-aligned only: n=184 sum=$+416.38 EV=$+2.2630 WR=20.7%
+    # Note: the filter raises per-trade EV but lowers total PnL by
+    # dropping ~half the trades; the user-visible benefit is more
+    # selective trades with less drawdown. Disabled by default.
+    gate_trend_aligned: bool = False
     # Apply the inversion suppression to all four sources by default.
     # iFVG is a reversal entry; with `ifvg_reverses_bias=True` (default)
     # the iFVG direction is the INVERSE of the source FVG's direction,
@@ -879,6 +1080,46 @@ class TrendStrategyParams:
     # the v17 XAUUSD recipe, which had no fee model).
     taker_fee_bps: float = 0.0       # 0.05% per side = 5.0 bps
     maker_fee_bps: float = 0.0       # 0.02% per side = 2.0 bps
+
+    # ── Post-init validation + deprecated-shim resolution ─────────
+    # Implemented as a method (not __post_init__) because dataclass
+    # ``__post_init__`` requires every inherited field to be supplied
+    # on construction — inconvenient for the factory pattern in
+    # ``optimal_config.optimal_params``. Callers should invoke
+    # ``self._resolve_deprecated()`` once after any manual edits to
+    # ``sniper_flip_direction`` (the canonical factory path does this
+    # automatically).
+    def _resolve_deprecated(self) -> None:
+        """Reconcile the deprecated ``sniper_flip_direction`` bool
+        with the canonical ``sniper_inv_direction_mode`` enum.
+
+        The legacy boolean maps as:
+            ``sniper_flip_direction=True``
+                → ``sniper_inv_direction_mode = "fade_displacement"``
+            ``sniper_flip_direction=False``
+                → no override (the enum's own value wins).
+
+        Emits a ``DeprecationWarning`` if the bool is set to True
+        so callers know to migrate.
+        """
+        # Validate enum value first
+        valid = ("continuation", "fade_displacement")
+        if self.sniper_inv_direction_mode not in valid:
+            raise ValueError(
+                f"sniper_inv_direction_mode must be one of {valid}, "
+                f"got {self.sniper_inv_direction_mode!r}"
+            )
+        # Bool shim
+        if self.sniper_flip_direction:
+            import warnings as _w
+            _w.warn(
+                "sniper_flip_direction=True is deprecated; use "
+                "optimal_params(sniper_inv_direction_mode='fade_displacement') "
+                "instead. The bool is honoured until 2026-12-31.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            self.sniper_inv_direction_mode = "fade_displacement"
 
     def resolve_sl_usd(self, atr_value: float | None = None) -> float:
         if self.use_atr_scaling and atr_value is not None and atr_value > 0:

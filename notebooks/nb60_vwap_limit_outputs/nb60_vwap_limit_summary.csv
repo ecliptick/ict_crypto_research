@@ -1,0 +1,2 @@
+month,n_signals,n_orders_placed,n_orders_filled,fill_rate_pct,n_orders_cancelled,n_orders_inversion_cancelled,n_soft_stops,n_inversions_submitted_opposite,n_trades,n_long,n_short,n_initial_source_trades,n_flip_source_trades,win_rate_pct,pnl_gross_usd,fees_paid_usd,pnl_net_usd,ev_per_trade_usd,exits
+2025-04,128,2090,1005,48.1,699,386,149,81,1005,402,603,489,516,26.27,1232.41,86.23,1146.18,1.1405,"{""sl"": 592, ""soft_sl"": 149, ""tp"": 217, ""eod"": 47}"

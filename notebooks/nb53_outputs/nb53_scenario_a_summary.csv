@@ -1,0 +1,2 @@
+scenario,n_trades,total_pnl_usd,ev_per_trade_usd,win_rate_pct,delta_pnl_vs_baseline
+A_flip_sniper (fade_displacement),48,-36.494317434458296,-0.7602982798845478,4.166666666666667,-99.2020000000023

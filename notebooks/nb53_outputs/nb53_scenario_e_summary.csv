@@ -1,0 +1,2 @@
+scenario,n_trades,mfe_mean_usd,mfe_median_usd,mfe_max_usd,mae_mean_usd,mae_min_usd,left_on_table_mean_usd,pct_mfe_gt_realized,pct_mfe_gt_0,pct_mfe_gt_1
+E_mfe_analysis,42,2.1141145238095036,-0.23155850000007278,15.848040000000031,-1.1671235714285633,-1.9975100000000001,0.5357857142856666,88.09523809523809,42.857142857142854,33.33333333333333

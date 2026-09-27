@@ -462,6 +462,88 @@ def _rolling_tier_label(pct: float, a_pct: float, c_pct: float) -> str:
     return "B"
 
 
+def compute_dynamic_wick_floor(
+    close: np.ndarray,
+    times_utc_ns: np.ndarray,
+    price_pct: float = 0.00025,
+    recompute_secs: int = 3600,
+) -> np.ndarray:
+    """Per-bar USD wick floor, scaled to current BTC price.
+
+    Added 2026-09-26 (BTC v17 SNIPER c): the strict-wick FVG filter
+    requires both outer candles to have a visible wick >= ``X`` USD.
+    A fixed USD value doesn't scale with BTC price; at BTC=$30k a
+    $25 floor is ~0.083% of price, at BTC=$120k it's 0.021%. This
+    helper computes a per-bar USD floor as
+    ``rolling_hourly_median_close × price_pct``, then expands the
+    hourly bucket to the per-bar resolution.
+
+    Algorithm:
+    1. Bucket bars by ``times_utc_ns // recompute_secs`` (integer
+       floor division). All bars in the same bucket share one
+       mid-price reference.
+    2. For each bucket, compute the median close within that bucket
+       (rolling lookback = current bucket, no future leakage).
+    3. Multiply by ``price_pct`` to get the USD floor.
+    4. Broadcast the bucket-level floor back to every bar in the
+       bucket via searchsorted.
+
+    Cost: O(N) for the bucket assignment, O(N log N) for one
+    groupby-style median per bucket. On a 1-month BTC file (2.6M
+    bars, ~720 buckets) this is sub-second.
+
+    Parameters
+    ----------
+    close : float64[N]
+        Per-bar close prices (the same array passed to
+        ``detect_fvg``).
+    times_utc_ns : int64[N]
+        Per-bar start timestamps in nanoseconds since epoch UTC.
+    price_pct : float
+        Fraction of mid-price to use as the USD floor. Default
+        0.00025 = 0.025% (BTC=$100k → $25).
+    recompute_secs : int
+        Recompute cadence in seconds. Default 3600 = hourly.
+
+    Returns
+    -------
+    floor_usd_per_bar : float64[N]
+        Per-bar USD threshold to plug into
+        ``detect_fvg(..., strict_wick_floor_usd_per_bar=...)``.
+    """
+    n = int(close.shape[0])
+    if times_utc_ns.shape[0] != n:
+        raise ValueError("close and times_utc_ns length mismatch")
+    bucket_id = (times_utc_ns // int(recompute_secs * 1_000_000_000)).astype(np.int64)
+    out = np.empty(n, dtype=np.float64)
+    # Pure-numpy bucket median (no pandas dependency):
+    # 1. Find bucket boundaries via argsort of bucket_id.
+    # 2. For each bucket, compute the cumulative median over the
+    #    sorted-into-bucket indices. No future leakage within a
+    #    bucket — only bars in [bucket_start, current_bar].
+    # Cost: O(N) bucket assignment + O(N) median over each bucket
+    # (numpy median on ~3600 bars/bucket = 24h, 1s data).
+    order = np.argsort(bucket_id, kind="stable")
+    sorted_buckets = bucket_id[order]
+    sorted_close = close[order]
+    # Use numpy's split + median over each contiguous bucket.
+    # The bucket_id array after sorting is grouped into contiguous
+    # runs of equal values; find the run boundaries.
+    boundaries = np.concatenate(([0], np.where(np.diff(sorted_buckets) != 0)[0] + 1, [n]))
+    bucket_medians = np.empty(int(sorted_buckets[-1]) - int(sorted_buckets[0]) + 1, dtype=np.float64)
+    # Compute bucket index relative to the minimum bucket_id so the
+    # lookup is dense.
+    min_bucket = int(sorted_buckets[0])
+    for k in range(len(boundaries) - 1):
+        lo, hi = int(boundaries[k]), int(boundaries[k + 1])
+        bucket_idx = int(sorted_buckets[lo]) - min_bucket
+        bucket_medians[bucket_idx] = float(np.median(sorted_close[lo:hi]))
+    # Broadcast back to per-bar resolution.
+    rel_bucket = bucket_id - min_bucket
+    out = bucket_medians[rel_bucket]
+    return (out * float(price_pct)).astype(np.float64)
+
+
 def compute_simple_atr(
     high: np.ndarray, low: np.ndarray, close: np.ndarray, length: int = 1200
 ) -> np.ndarray:
@@ -486,6 +568,70 @@ def compute_simple_atr(
     counts = (idx + 1 - win_start).astype(np.float64)
     out = (csum[idx + 1] - csum[win_start]) / counts
     return out
+
+
+def compute_atr_on_resampled_bars(
+    bars: "pd.DataFrame", resample_secs: int = 60, length: int = 1200,
+) -> np.ndarray:
+    """Compute ATR on ``resample_secs``-second bars, broadcast back to per-bar.
+
+    The fix (2026-09-27) addresses a long-standing under-count: the
+    1-second bar ATR is dominated by 1-second noise (~25× smaller
+    than the structural-range ATR). Aggregating to 1-minute bars
+    first, then computing ATR on those bars, gives the value the
+    recipe's ``atr_len`` actually intends.
+
+    ``length`` is interpreted as the number of resampled bars in the
+    rolling window (NOT 1-second bars). For ``resample_secs=60`` and
+    ``length=1200`` the window covers ~20 hours of 1-minute bars.
+
+    Returns a float64 array of length ``len(bars)`` (per-bar forward-
+    filled from the per-resample-bucket ATR).
+    """
+    if bars is None or len(bars) == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    # Per-bar numpy views
+    high_1s = bars["high"].to_numpy(dtype=np.float64)
+    low_1s = bars["low"].to_numpy(dtype=np.float64)
+    close_1s = bars["close"].to_numpy(dtype=np.float64)
+    n = high_1s.shape[0]
+
+    # Bucket index per bar (assumes bars are sorted, contiguous, 1s spacing).
+    bucket = np.arange(n) // resample_secs
+    n_buckets = int(bucket[-1]) + 1
+
+    bucket_starts = np.searchsorted(bucket, np.arange(n_buckets), side='left')
+    bucket_ends = np.searchsorted(bucket, np.arange(n_buckets), side='right')
+
+    bucket_high = np.zeros(n_buckets, dtype=np.float64)
+    bucket_low = np.zeros(n_buckets, dtype=np.float64)
+    bucket_close = np.zeros(n_buckets, dtype=np.float64)
+    for b in range(n_buckets):
+        sl = bucket_starts[b]
+        el = bucket_ends[b]
+        bucket_high[b] = high_1s[sl:el].max()
+        bucket_low[b] = low_1s[sl:el].min()
+        bucket_close[b] = close_1s[el - 1]
+
+    # Compute ATR on the resampled bars
+    prev_close = np.concatenate([[bucket_close[0]], bucket_close[:-1]])
+    tr = np.maximum.reduce([
+        bucket_high - bucket_low,
+        np.abs(bucket_high - prev_close),
+        np.abs(bucket_low - prev_close),
+    ])
+    if n_buckets <= 1 or length <= 1:
+        atr_resampled = tr.copy()
+    else:
+        csum = np.concatenate([[0.0], np.cumsum(tr)])
+        idx = np.arange(n_buckets)
+        win_start = np.maximum(0, idx - length + 1)
+        counts = (idx + 1 - win_start).astype(np.float64)
+        atr_resampled = (csum[idx + 1] - csum[win_start]) / counts
+
+    # Broadcast back to per-bar resolution
+    return atr_resampled[bucket]
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -542,6 +688,15 @@ class FvgZone:
                               # marks the zone dead at ``played_out_bar`` so
                               # neither the FVG nor the iFVG path can reopen
                               # a new position on it. (-1 = not played out).
+    # ── Strict-wick annotation (added 2026-09-26, nb52 H.3) ────────
+    # The MIN of (c1 wick, c3 wick) on the side AWAY from the gap —
+    # the "weakest link" wick length. Used by the post-hoc strict-wick
+    # filter in ``_nb52_worker._filter_zones_post_hoc`` so the cache
+    # can be shared across strict-wick-on and strict-wick-off configs.
+    # Always populated at zone-creation time (regardless of whether
+    # ``strict_wick_required`` was on or off); default 0.0 = no
+    # measurement.
+    wick_length_usd: float = 0.0
     live: bool = True       # False once consumed, expired, superseded, OR played out
     # ── PIVOT F+I (added 2026-09-17) ─────────────────────────────────────
     # Track how many bars have had their range overlap the zone (i.e. real
@@ -653,6 +808,27 @@ def detect_fvg(
     invalidation_min_consecutive_bars: int = 1,
     require_retest_to_invert: bool = False,
     played_out_min_extension_usd: float = 0.0,
+    # ── 2026-09-26 (nb53 alpha): strict-wick FVG detection ─────────
+    # When ``strict_wick_required=True``, the detector requires both
+    # outer candles (c1 and c3) to have a visible wick on the side
+    # AWAY from the gap — i.e. for a bull FVG (c1.H < c3.L), c1 must
+    # have a lower wick (c1.L < c1.body_low) and c3 must have an
+    # upper wick (c3.H > c3.body_high). The wick length must be at
+    # least ``strict_wick_min_wick_usd`` USD. Body definition matches
+    # ``fvg_body_definition`` ("body" = abs(close-open), "range" =
+    # high-low). This filters the "triggered on non-wicked candles"
+    # case where c1 and c3 are essentially doji.
+    strict_wick_required: bool = False,
+    strict_wick_min_wick_usd: float = 0.0,
+    # ── 2026-09-26: per-bar dynamic wick floor (BTC v17 c) ───────────
+    # When supplied, overrides ``strict_wick_min_wick_usd`` per bar.
+    # Length must equal ``len(close)``; entry ``[i]`` is the floor
+    # used when zone's trigger_bar == ``i``. Recomputed upstream at
+    # ``strict_wick_recompute_secs`` cadence from
+    # ``mid_price * strict_wick_min_wick_price_pct`` (see
+    # ``compute_dynamic_wick_floor`` helper). Lets the filter scale
+    # with BTC price without per-bar recompute cost.
+    strict_wick_floor_usd_per_bar: np.ndarray | None = None,
     # ── 2026-09-15: body-only mitigation / invalidation knobs ───────
     # When ``body_only_mitigation=True``, mitigation fires only when
     # the candle BODY (open↔close range) crosses the zone edge — NOT
@@ -980,12 +1156,69 @@ Expired zones are NOT drawn by the visualizer and the
             threshold = fvg_min_zone_atr_mult * atr_for_min_zone
             if (zh - zl) < threshold:
                 continue
+        # ── Strict-wick filter (added 2026-09-26, nb53 alpha) ───────
+        # Require both outer candles (c1, c3) to have a visible wick
+        # on the side AWAY from the gap. "Visible wick" = the candle's
+        # range extreme extends at least ``strict_wick_min_wick_usd``
+        # past its body in the relevant direction. Filters "non-wicked
+        # candles" where c1 or c3 are essentially flat-body / doji.
+        # ── Strict-wick annotation (added 2026-09-26, nb52 H.3) ────
+        # Always compute the minimum wick length on the side away from
+        # the gap, regardless of whether ``strict_wick_required`` is
+        # on. The post-hoc filter in ``_nb52_worker`` reads this value
+        # so the cache can be shared across strict-wick configs.
+        # ── 2026-09-26: dynamic wick floor (BTC v17 c) ────────────
+        # When ``strict_wick_floor_usd_per_bar`` is supplied, look up
+        # the per-bar USD threshold at this zone's trigger bar. The
+        # per-bar array is precomputed upstream at
+        # ``strict_wick_recompute_secs`` cadence (typically hourly),
+        # so this lookup is O(1) with no per-bar recompute cost.
+        if strict_wick_floor_usd_per_bar is not None:
+            wick_floor_usd = float(strict_wick_floor_usd_per_bar[i])
+        else:
+            wick_floor_usd = float(strict_wick_min_wick_usd)
+
+        if fvg_body_definition == "range":
+            c1_body_low = float(scan_low[i - 2])
+            c1_body_high = float(scan_high[i - 2])
+            c3_body_low = float(scan_low[i])
+            c3_body_high = float(scan_high[i])
+        else:
+            c1_open = float(scan_open[i - 2])
+            c1_close = float(scan_close[i - 2])
+            c3_open = float(scan_open[i])
+            c3_close = float(scan_close[i])
+            c1_body_low = min(c1_open, c1_close)
+            c1_body_high = max(c1_open, c1_close)
+            c3_body_low = min(c3_open, c3_close)
+            c3_body_high = max(c3_open, c3_close)
+        if direction == 1:
+            # Bull FVG: wicks are c1.L->c1.body_low and c3.body_high->c3.H.
+            c1_lower_wick = c1_body_low - float(scan_low[i - 2])
+            c3_upper_wick = float(scan_high[i]) - c3_body_high
+            zone_wick_usd = float(min(c1_lower_wick, c3_upper_wick))
+            if strict_wick_required:
+                if c1_lower_wick < wick_floor_usd:
+                    continue
+                if c3_upper_wick < wick_floor_usd:
+                    continue
+        else:
+            # Bear FVG: wicks are c1.body_high->c1.H and c3.L->c3.body_low.
+            c1_upper_wick = float(scan_high[i - 2]) - c1_body_high
+            c3_lower_wick = c3_body_low - float(scan_low[i])
+            zone_wick_usd = float(min(c1_upper_wick, c3_lower_wick))
+            if strict_wick_required:
+                if c1_upper_wick < wick_floor_usd:
+                    continue
+                if c3_lower_wick < wick_floor_usd:
+                    continue
         trigger_bar_1s = int(scan_index_map[i]) if scan_index_map is not None else i
         new_zone = FvgZone(
             trigger_bar=trigger_bar_1s,
             direction=direction,
             zone_low=zl,
             zone_high=zh,
+            wick_length_usd=zone_wick_usd,
         )
         # ── Supersession on price-range overlap (added 2026-08-20) ─────
         # When a NEW zone's [zone_low, zone_high] overlaps an existing
@@ -1166,11 +1399,16 @@ Expired zones are NOT drawn by the visualizer and the
             # ── Deepest depth bar ──
             # Python loop tracks ``if depth_pct > deepest_pct`` —
             # the FIRST bar where depth is maximum. Numpy equivalent:
-            deepest_local = int(np.argmax(seg_depth_pct))
-            deepest_pct_val = float(seg_depth_pct[deepest_local])
-            if deepest_pct_val > deepest_pct:
-                deepest_pct = deepest_pct_val
-                deepest_bar = start_bar + deepest_local
+            # Defensive guard: ``seg_depth_pct`` can be empty when
+            # the zone was born at the very last bar(s) of the corpus
+            # (start_bar close to n_1s); in that case skip the
+            # depth tracking — there's nothing to track.
+            if seg_depth_pct.size > 0:
+                deepest_local = int(np.argmax(seg_depth_pct))
+                deepest_pct_val = float(seg_depth_pct[deepest_local])
+                if deepest_pct_val > deepest_pct:
+                    deepest_pct = deepest_pct_val
+                    deepest_bar = start_bar + deepest_local
             # ── PIVOT F+I (2026-09-17): touch count ─────────────────
             # Count how many bars had their range OVERLAP the zone (any
             # overlap, not just close-inside-zone). A bar's range touches
@@ -1849,6 +2087,9 @@ def generate_ict_pending_signals(
     ict: IctSeries,
     p,  # TrendStrategyParams (avoid circular import on type hint)
     src: str | None = None,
+    *,                  # NB: everything below is kwarg-only
+    precomputed_zones: list | None = None,
+    wick_floor_per_bar: np.ndarray | None = None,
 ) -> list:
     """Generate pending signals from FVG / iFVG / ORB / Wyckoff detectors.
 
@@ -1914,6 +2155,37 @@ def generate_ict_pending_signals(
         if atr_v > 0:
             sl_usd = float(p.sl_atr_mult) * atr_v
             tp_usd = float(p.tp_atr_mult) * atr_v
+    # ── Immediate-mode SL/TP mode selector (added 2026-09-26 d) ──────
+    # Override the (sl_usd, tp_usd) master values according to the
+    # ``immediate_sl_mode`` / ``immediate_tp_mode`` enums. This is
+    # parallel to the sniper-mode knobs and lets the non-sniper
+    # ``entry_mode='immediate'`` path choose zone_mult / atr_mult /
+    # usd_fixed for SL/TP symmetrically.
+    #  * "" or "usd_fixed"  → keep the legacy (use_atr_scaling) value
+    #  * "atr_mult"         → pinned to (sl_atr_mult, tp_atr_mult)*ATR
+    #  * "zone_mult"        → fvg_*_per_breadth = immediate_*_zone_mult
+    #                          so the existing breadth-scaling path
+    #                          emits the per-signal SL/TP correctly.
+    _imm_sl_mode = str(getattr(p, "immediate_sl_mode", "") or "")
+    _imm_tp_mode = str(getattr(p, "immediate_tp_mode", "") or "")
+    _imm_sl_zone = float(getattr(p, "immediate_sl_zone_mult", 0.0))
+    _imm_tp_zone = float(getattr(p, "immediate_tp_zone_mult", 0.0))
+    if _imm_sl_mode == "atr_mult" and ict.atr.shape[0] > 0:
+        _atr_v = float(ict.atr[-1]) if ict.atr[-1] > 0 else 0.0
+        if _atr_v > 0:
+            sl_usd = float(p.sl_atr_mult) * _atr_v
+    elif _imm_sl_mode == "zone_mult" and _imm_sl_zone > 0:
+        # Set the per_breadth knob — the FVG signal loop reads
+        # fvg_sl_per_breadth and applies it per-zone. Mutating the
+        # TrendStrategyParams-influenced locals is sufficient because
+        # the breath logic runs in this same function frame.
+        sl_per_b = _imm_sl_zone
+    if _imm_tp_mode == "atr_mult" and ict.atr.shape[0] > 0:
+        _atr_v = float(ict.atr[-1]) if ict.atr[-1] > 0 else 0.0
+        if _atr_v > 0:
+            tp_usd = float(p.tp_atr_mult) * _atr_v
+    elif _imm_tp_mode == "zone_mult" and _imm_tp_zone > 0:
+        tp_per_b = _imm_tp_zone
 
     # ── Market-structure conviction (added 2026-08-19) ─────────────────────
     # When ``use_market_structure=True``, build a StructureState once
@@ -2021,44 +2293,64 @@ def generate_ict_pending_signals(
             )
             structure_events_for_detector = struct_state_for_inv.events
 
-        zones = detect_fvg(
-            open_, high, low, close,
-            resample_to_n_secs=rs if rs > 0 else 0,
-            fvg_min_zone_usd=min_z,
-            max_active_zones=max_zones,
-            max_zone_age_bars=detector_max_age,
-            fvg_displacement_ratio=float(p.fvg_displacement_ratio),
-            fvg_body_definition=str(p.fvg_body_definition),
-            fvg_min_zone_atr_mult=float(getattr(p, "fvg_min_zone_atr_mult", 0.0)),
-            atr_for_min_zone=float(getattr(p, "fvg_min_zone_atr", 0.0)),
-            # Supersession rule (added 2026-08-20): when a new FVG
-            # overlaps an older live zone's price range, the older zone
-            # is marked superseded and won't fire a retest. Only the
-            # freshest level in a region is structurally interesting.
-            # ``fvg_supersede_on_new`` defaults True in the strategy
-            # params; the detector's own ``supersede_on_new`` defaults
-            # False (deterministic for ad-hoc callers).
-            supersede_on_new=bool(getattr(p, "fvg_supersede_on_new", True)),
-            invalidation_min_pierce_usd=float(getattr(p, "fvg_invalidation_min_pierce_usd", 0.0)),
-            invalidation_min_consecutive_bars=int(getattr(p, "fvg_invalidation_min_consecutive_bars", 1)),
-            require_retest_to_invert=bool(getattr(p, "fvg_require_retest_to_invert", True)),
-            played_out_min_extension_usd=float(getattr(p, "played_out_min_extension_usd", 0.0)),
-            # 2026-09-15: body-only mitigation / invalidation knobs.
-            # Forwarded from the strategy params. Default False (legacy
-            # close-only semantics) so existing callers are unaffected.
-            body_only_mitigation=bool(getattr(p, "fvg_body_only_mitigation", False)),
-            body_only_invalidation=bool(getattr(p, "fvg_body_only_invalidation", False)),
-            # 2026-09-05: structure-driven invalidation (optional).
-            structure_events_per_bar=structure_events_for_detector,
-            structure_invalidation_age_secs=int(getattr(p, "fvg_structure_invalidation_age_secs", 0)),
-            times_utc_ns=times_utc_ns,
-            # 2026-09-17: minimum FVG lifetime filter. When > 0, drops
-            # "born-dead" zones (those whose first end event fires within
-            # N seconds of trigger). Reduces noise on 1s XAUUSD — the
-            # detector still emits every zone, but only the ones that
-            # survived a meaningful window make it to the retest scanner.
-            fvg_min_lifetime_secs=int(getattr(p, "fvg_min_lifetime_secs", 0)),
-        )
+        # ── Cache short-circuit (added 2026-09-26) ─────────────────
+        # When precomputed_zones is supplied (typically from the sweep
+        # cache in src.tick.cache.SweepCache), skip detect_fvg entirely.
+        # Same input arrays + same params = same zones, so caching is a
+        # pure speedup (bit-identical trade selection).
+        if precomputed_zones is not None:
+            zones = list(precomputed_zones)
+        else:
+            zones = detect_fvg(
+                open_, high, low, close,
+                resample_to_n_secs=rs if rs > 0 else 0,
+                fvg_min_zone_usd=min_z,
+                max_active_zones=max_zones,
+                max_zone_age_bars=detector_max_age,
+                fvg_displacement_ratio=float(p.fvg_displacement_ratio),
+                fvg_body_definition=str(p.fvg_body_definition),
+                fvg_min_zone_atr_mult=float(getattr(p, "fvg_min_zone_atr_mult", 0.0)),
+                atr_for_min_zone=float(getattr(p, "fvg_min_zone_atr", 0.0)),
+                # Supersession rule (added 2026-08-20): when a new FVG
+                # overlaps an older live zone's price range, the older zone
+                # is marked superseded and won't fire a retest. Only the
+                # freshest level in a region is structurally interesting.
+                # ``fvg_supersede_on_new`` defaults True in the strategy
+                # params; the detector's own ``supersede_on_new`` defaults
+                # False (deterministic for ad-hoc callers).
+                supersede_on_new=bool(getattr(p, "fvg_supersede_on_new", True)),
+                invalidation_min_pierce_usd=float(getattr(p, "fvg_invalidation_min_pierce_usd", 0.0)),
+                invalidation_min_consecutive_bars=int(getattr(p, "fvg_invalidation_min_consecutive_bars", 1)),
+                require_retest_to_invert=bool(getattr(p, "fvg_require_retest_to_invert", True)),
+                played_out_min_extension_usd=float(getattr(p, "played_out_min_extension_usd", 0.0)),
+                # 2026-09-15: body-only mitigation / invalidation knobs.
+                # Forwarded from the strategy params. Default False (legacy
+                # close-only semantics) so existing callers are unaffected.
+                body_only_mitigation=bool(getattr(p, "fvg_body_only_mitigation", False)),
+                body_only_invalidation=bool(getattr(p, "fvg_body_only_invalidation", False)),
+                # 2026-09-05: structure-driven invalidation (optional).
+                structure_events_per_bar=structure_events_for_detector,
+                structure_invalidation_age_secs=int(getattr(p, "fvg_structure_invalidation_age_secs", 0)),
+                times_utc_ns=times_utc_ns,
+                # 2026-09-17: minimum FVG lifetime filter. When > 0, drops
+                # "born-dead" zones (those whose first end event fires within
+                # N seconds of trigger). Reduces noise on 1s XAUUSD — the
+                # detector still emits every zone, but only the ones that
+                # survived a meaningful window make it to the retest scanner.
+                fvg_min_lifetime_secs=int(getattr(p, "fvg_min_lifetime_secs", 0)),
+                # 2026-09-26 (BTC v17 c): strict-wick FVG detection
+                # Filters zones where c1 or c3 lack a visible wick on
+                # the side away from the gap. Floor is per-bar and
+                # supplied by the caller (computed upstream from
+                # ``strict_wick_min_wick_price_pct`` × hourly median
+                # close, see ``compute_dynamic_wick_floor``). See
+                # ``detect_fvg``'s docstring for the full definition.
+                strict_wick_required=bool(getattr(p, "strict_wick_required", False)),
+                strict_wick_min_wick_usd=float(
+                    getattr(p, "strict_wick_min_wick_usd", 0.0)
+                ),
+                strict_wick_floor_usd_per_bar=wick_floor_per_bar,
+            )
         # ── Structure-driven invalidation counter (added 2026-09-05) ─
         # A zone was structurally invalidated (vs price-side) when:
         #   * ``inverted=True``
@@ -2374,8 +2666,14 @@ def generate_ict_pending_signals(
             from .market_structure import annotate_choch_plus
             annotate_choch_plus(structure_state, zones)
         # Breadth-scaled SL/TP knobs (added 2026-08-18)
-        sl_per_b = float(p.fvg_sl_per_breadth)
-        tp_per_b = float(p.fvg_tp_per_breadth)
+        # Re-read AFTER the immediate-mode override above so the FVG
+        # breath path picks up the new mode when needed.
+        sl_per_b = float(p.fvg_sl_per_breadth) or float(getattr(p, "immediate_sl_zone_mult", 0.0))
+        tp_per_b = float(p.fvg_tp_per_breadth) or float(getattr(p, "immediate_tp_zone_mult", 0.0))
+        if str(getattr(p, "immediate_sl_mode", "") or "") == "zone_mult":
+            sl_per_b = float(getattr(p, "immediate_sl_zone_mult", 0.0))
+        if str(getattr(p, "immediate_tp_mode", "") or "") == "zone_mult":
+            tp_per_b = float(getattr(p, "immediate_tp_zone_mult", 0.0))
         # Inverted-zone suppression (added 2026-08-19): when running
         # the FVG pipeline (only_inv=False), skip any retest whose
         # zone has been inverted. iFVG owns inverted zones — letting
@@ -2399,6 +2697,17 @@ def generate_ict_pending_signals(
             if retest_lookback > 0 and zone is not None:
                 anchor = zone.inverted_bar if only_inv else zone.mitigated_bar
                 if anchor < 0 or (bar - anchor) > retest_lookback:
+                    continue
+            # Mitigation-distance floor (added 2026-09-26, nb53 alpha
+            # Scenario D): drop zones whose mitigation / inversion
+            # happened within ``fvg_min_mit_distance_bars`` of the
+            # trigger bar. A 1-bar-apart mitigation is a drive-through,
+            # not a real fill. The "true mitigation" hypothesis is that
+            # a fill that takes ≥ N bars is a price-side commitment.
+            mit_dist = int(getattr(p, "fvg_min_mit_distance_bars", 0))
+            if mit_dist > 0 and zone is not None:
+                anchor_bar = zone.inverted_bar if only_inv else zone.mitigated_bar
+                if anchor_bar < 0 or (anchor_bar - zone.trigger_bar) < mit_dist:
                     continue
             # Bias gate (added 2026-08-18 inversion handling).
             # Default semantic: signal direction must equal the

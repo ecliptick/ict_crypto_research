@@ -1,0 +1,3 @@
+label,n_trades,pnl_total_usd,ev_per_trade_usd,win_rate_pct,trades_per_day,fees_total_usd,elapsed_s,delta_pnl_usd
+sniper (canonical),25,164.12039456554874,6.564815782621949,44.0,1.1563639634160705,0.0,5.668004200007999,
+immediate_on_mitigation,25,164.12039456554874,6.564815782621949,44.0,1.1563639634160705,0.0,4.922282300001825,0.0

@@ -97,6 +97,7 @@ class Trade:
     taker_bps_charged: float = 0.0
     entry_triggered_by: str = "fvg"
     lots: float = 0.0
+    qty_btc: float = 0.0               # 2026-09-26: BTC-native alias of `lots`
     layer_idx: int = 0               # which of the N layers this trade came from
     n_layers_signal: int = 1         # total layers for the parent signal
     signal_id: int = -1
@@ -256,6 +257,86 @@ class IctBacktestResult:
             "ev_per_trade": float(ev),
             "n_soft_stops": int(self.n_soft_stops),
         }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# ATR resampling helper (added 2026-09-27 — bugfix for 1s-bar ATR)
+# ────────────────────────────────────────────────────────────────────────────
+
+# Resample 1s bars → 1m bars before computing ATR. ``atr_len`` is
+# then interpreted as the number of 1-min bars in the rolling window
+# (NOT the number of 1-sec bars). Without this fix the per-bar TR
+# is dominated by 1-second noise and the resulting ATR is ~25× too
+# small, which forces strategies that use ``sniper_sl_mode='atr_mult'``
+# (and ``immediate_sl_mode='atr_mult'``) to compensate with absurd
+# multipliers like 48× or 96× just to land SL in a sane dollar range.
+_ATR_RESAMPLE_SECS = 60
+
+
+def _compute_atr_resampled(
+    high: np.ndarray, low: np.ndarray, close: np.ndarray, length: int
+) -> np.ndarray:
+    """Compute rolling ATR on 1-min bars, broadcast back to per-bar resolution.
+
+    The function assumes the caller has 1-second bars. Internally it
+    aggregates to 1-min bars via ``np``-level bucketing (no pandas
+    datetime parsing) so it is safe to call from the bar loop without
+    forcing a pandas conversion.
+
+    Returns
+    -------
+    atr_per_bar : np.ndarray, shape (n_bars,)
+        Forward-filled 1-min ATR, broadcast back to the per-bar
+        resolution of the input.
+    """
+    n = high.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    # Bucket index per 1-second bar
+    bucket = np.arange(n) // _ATR_RESAMPLE_SECS
+    n_buckets = int(bucket[-1]) + 1
+
+    # Aggregate to per-bucket OHLC. ``np.add.reduceat`` on a sorted-by-key
+    # index is fast. The first occurrence of each bucket is the "open"
+    # (we use close[first_occurrence_idx]); the max of high in the bucket
+    # is "high", min of low is "low"; close of last occurrence is "close".
+    bucket_starts = np.searchsorted(bucket, np.arange(n_buckets), side='left')
+    bucket_ends = np.searchsorted(bucket, np.arange(n_buckets), side='right')
+    # Open = close at bucket start (first bar's close in each minute)
+    bucket_open_idx = bucket_starts
+    bucket_close_idx = np.minimum(bucket_ends - 1, n - 1)
+    bucket_high = np.zeros(n_buckets, dtype=np.float64)
+    bucket_low = np.zeros(n_buckets, dtype=np.float64)
+    bucket_open = np.zeros(n_buckets, dtype=np.float64)
+    bucket_close = np.zeros(n_buckets, dtype=np.float64)
+    for b in range(n_buckets):
+        sl = bucket_starts[b]
+        el = bucket_ends[b]
+        bucket_high[b] = high[sl:el].max()
+        bucket_low[b] = low[sl:el].min()
+        bucket_open[b] = close[sl]
+        bucket_close[b] = close[el - 1]
+
+    # Compute ATR on the 1-min bars
+    prev_close = np.concatenate([[bucket_close[0]], bucket_close[:-1]])
+    tr = np.maximum.reduce([
+        bucket_high - bucket_low,
+        np.abs(bucket_high - prev_close),
+        np.abs(bucket_low - prev_close),
+    ])
+    if n_buckets <= 1 or length <= 1:
+        atr_1m = tr.copy()
+    else:
+        csum = np.concatenate([[0.0], np.cumsum(tr)])
+        idx = np.arange(n_buckets)
+        win_start = np.maximum(0, idx - length + 1)
+        counts = (idx + 1 - win_start).astype(np.float64)
+        atr_1m = (csum[idx + 1] - csum[win_start]) / counts
+
+    # Broadcast back to per-1s-bar resolution: each 1s bar inherits
+    # the ATR of the 1-min bucket it belongs to.
+    atr_per_bar = atr_1m[bucket]
+    return atr_per_bar
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -538,6 +619,10 @@ def run_ict_backtest(
     p: TrendStrategyParams,
     *,
     strategy_label: str = "ict",
+    precomputed_structure=None,                  # StructureState or None
+    precomputed_zones_by_src: dict | None = None,  # {"fvg": [...], "ifvg": [...]}
+    precomputed_atr: np.ndarray | None = None,   # float64[N] ATR or None
+    precomputed_wick_floor_usd: np.ndarray | None = None,  # float64[N] per-bar USD
 ) -> IctBacktestResult:
     """Run the ICT-only backtest on a 1s OHLC dataframe.
 
@@ -578,15 +663,26 @@ def run_ict_backtest(
     close = df['close'].to_numpy(dtype=np.float64)
 
     # ── Compute IctSeries: ATR + structure-state trend ────────────────
-    atr_arr = compute_simple_atr(high, low, close, length=int(p.atr_len))
-    structure = detect_market_structure(
-        high, low, close,
-        pivot_len=int(p.ms_pivot_len),
-        liquidity_len=int(p.ms_liquidity_len),
-        detect_order_blocks=bool(p.ms_draw_order_blocks),
-        detect_liquidity=bool(p.ms_draw_liquidity_sweeps),
-        resample_to_n_secs=int(getattr(p, 'ms_resample_secs', 0)),
-    )
+    # Cache short-circuit (added 2026-09-26): when the caller
+    # provides precomputed_atr / precomputed_structure (typically
+    # from src.tick.cache.SweepCache), skip the recomputation.
+    # SL/TP zone-width overrides do NOT affect either ATR or
+    # structure, so the cache is invariant under sweep configs.
+    if precomputed_atr is not None:
+        atr_arr = np.asarray(precomputed_atr, dtype=np.float64)
+    else:
+        atr_arr = _compute_atr_resampled(high, low, close, length=int(p.atr_len))
+    if precomputed_structure is not None:
+        structure = precomputed_structure
+    else:
+        structure = detect_market_structure(
+            high, low, close,
+            pivot_len=int(p.ms_pivot_len),
+            liquidity_len=int(p.ms_liquidity_len),
+            detect_order_blocks=bool(p.ms_draw_order_blocks),
+            detect_liquidity=bool(p.ms_draw_liquidity_sweeps),
+            resample_to_n_secs=int(getattr(p, 'ms_resample_secs', 0)),
+        )
     ict_series = IctSeries(
         trend=structure.trend,
         atr=atr_arr,
@@ -663,12 +759,59 @@ def run_ict_backtest(
     for src in srcs:
         if src in ("gmma",):
             continue
+        # ── Cache short-circuit (added 2026-09-26) ─────────────
+        # If the caller precomputed zones for this source (via
+        # src.tick.cache.SweepCache), feed them directly to the
+        # signal generator instead of recomputing via detect_fvg.
+        # precomputed_zones_by_src is keyed by source name.
+        # IMPORTANT (bugfix 2026-09-26): ``detect_fvg`` MUTATES the
+        # zone objects in place (sets mitigated_bar / inverted_bar /
+        # superseded_bar / played_out_bar / expired_bar). When the
+        # caller passes a SHARED zone list (cached across sweep
+        # configs), the second config would see zones already
+        # flagged as mitigated/inverted from the first config and
+        # produce zero trades. Clone the zone list (shallow copy of
+        # each FvgZone) so each backtest call gets a fresh state.
+        pre_zones_src = (precomputed_zones_by_src or {}).get(src)
+        if pre_zones_src is not None:
+            import dataclasses
+            pre_zones = [dataclasses.replace(z) for z in pre_zones_src]
+        else:
+            pre_zones = None
         signals.extend(generate_ict_pending_signals(
             close, open_, high, low, times_ns, ict_series, p, src=src,
+            precomputed_zones=pre_zones,
+            wick_floor_per_bar=precomputed_wick_floor_usd,
         ))
     # Sort by (trigger_bar, direction) so the bar-loop sees them in
     # deterministic order. Stable sort preserves source order.
     signals.sort(key=lambda s: (s.trigger_bar, s.direction))
+
+    # Structural-alpha gate (added 2026-09-26, vBTC3 finding): drop
+    # signals whose direction doesn't agree with the structure trend
+    # at the trigger bar. Disabled by default (gate_trend_aligned=False
+    # on TrendStrategyParams).
+    if getattr(p, "gate_trend_aligned", False) and precomputed_structure is not None:
+        trend = getattr(precomputed_structure, "trend", None)
+        if trend is not None:
+            before = len(signals)
+            kept = []
+            for s in signals:
+                tb = int(getattr(s, "trigger_bar", 0))
+                if 0 <= tb < len(trend):
+                    t = int(trend[tb])
+                    if t == 0:
+                        # No trend info yet — keep the signal.
+                        kept.append(s)
+                    elif (t > 0 and int(s.direction) > 0) or (t < 0 and int(s.direction) < 0):
+                        kept.append(s)
+                else:
+                    kept.append(s)
+            signals = kept
+            n_dropped = before - len(signals)
+            if n_dropped:
+                print(f"  trend-gate: dropped {n_dropped}/{before} counter-trend signals")
+
     sig_iter = iter(signals)
     sig = next(sig_iter, None)
 
@@ -713,6 +856,7 @@ def run_ict_backtest(
     n_sniper_triggered = 0
     n_sniper_cancelled = 0
     n_sniper_expired = 0
+    n_ifvg_clean_emitted = 0  # added 2026-09-26: clean-zone immediate entries
     # BUG FIX (2026-09-17): signal_id was set to bar index ``i`` which
     # collides when multiple signals fire on the same bar. We now use a
     # simple incrementing counter so each signal gets a unique ID.
@@ -761,10 +905,20 @@ def run_ict_backtest(
     _bos_ignore = bool(getattr(p, "bos_choch_ignore_invert_when_aligned", True))
     _entry_mode = str(getattr(p, "entry_mode", "immediate"))
     _ms_boost = float(getattr(p, "ms_boost_conviction", 1.0))
-    _lots = float(p.lots)
+    _lots = float(getattr(p, "qty_btc", getattr(p, "lots", 0.001)))  # 2026-09-26: qty_btc
     _atr_anchor = bool(getattr(p, "atr_anchor_sl_tp", False))
     _sl_atr_mult = float(getattr(p, "sl_atr_mult", 0.25))
     _tp_atr_mult = float(getattr(p, "tp_atr_mult", 0.55))
+    # ── Immediate-mode SL/TP mode selector (added 2026-09-26 d) ──────
+    # Promote the immediate_*_mode enum values into the legacy
+    # _atr_anchor flag so the ladder-layer branch below picks up the
+    # atr_mult selection. The ``zone_mult`` arm is handled upstream
+    # in ``generate_pending_signals`` via the existing
+    # ``fvg_*_per_breadth`` breath path (see ict_signals.py).
+    _imm_sl_mode_v = str(getattr(p, "immediate_sl_mode", "") or "")
+    _imm_tp_mode_v2 = str(getattr(p, "immediate_tp_mode", "") or "")
+    if _imm_sl_mode_v == "atr_mult" or _imm_tp_mode_v2 == "atr_mult":
+        _atr_anchor = True
     _tiebreak = str(getattr(p, "sl_tp_tiebreak", "sl_first"))
     # ── PIVOT E: trailing SL params ────────────────────────────────────
     _trailing_enabled = bool(getattr(p, "trailing_sl_enabled", False))
@@ -876,10 +1030,17 @@ def run_ict_backtest(
         # unaffected. We intercept HERE (before the sweep/elif paths)
         # because both existing paths consume the signal via
         # ``sig = next(sig_iter, None)`` — there is no second chance.
+        #
+        # When ``p.entry_mode == "dual"`` (added 2026-09-26, nb56
+        # follow-up), the Sniper queue is populated AND the signal
+        # falls through to the elif path below so the immediate
+        # ladder also fires. The two queues target different events
+        # (mit vs inv) on the same zone, so they produce disjoint
+        # trade sets and do not double-count the same fill.
         if (
             sig is not None
             and sig.trigger_bar == i
-            and _entry_mode == "sniper"
+            and _entry_mode in ("sniper", "dual")
             and str(getattr(sig, "triggered_by", "")) in ("fvg", "ifvg")
         ):
             sig_zone = getattr(sig, "fvg_zone", None)
@@ -897,7 +1058,11 @@ def run_ict_backtest(
                     "triggered_by": str(getattr(sig, "triggered_by", "")),
                     "trigger_price": b_close,
                 })
-                sig = next(sig_iter, None)
+                # Sniper mode consumes the signal (so the elif
+                # ladder path below doesn't also fire). Dual mode
+                # keeps the signal alive so the elif fires too.
+                if _entry_mode == "sniper":
+                    sig = next(sig_iter, None)
         if (
             sig is not None
             and sig.trigger_bar == i
@@ -943,7 +1108,7 @@ def run_ict_backtest(
                 "fill_price": float(sig.fill_price),
                 "submit_bar": i,
                 "submit_time_ns": b_time,
-                "lots": float(p.lots),
+                "qty_btc": float(getattr(p, "qty_btc", 0.001)),
                 "direction": sig.direction,
                 "stop_usd": scaled_sl,
                 "target_usd": scaled_tp,
@@ -988,6 +1153,11 @@ def run_ict_backtest(
                 zh = b_close + 0.25
                 breadth = abs(zh - zl)
             num_layers = max(1, int(p.num_layers))
+            # Optional cap from ladder_num_layers_max (nb57). The original
+            # ``p.num_layers`` knob is preserved; this caps it to test
+            # the "drop innermost layers" hypothesis without renaming
+            # the existing knob. Default 3 = no-op.
+            num_layers = min(num_layers, max(1, int(getattr(p, "ladder_num_layers_max", 3))))
             # ── Rolling FVG percentile tier (added 2026-09-17) ─────────
             # Causal rank of this zone's anchor vs the past N same-direction
             # zones. Drives SL/TP scales and optional outermost-layer skip.
@@ -1057,15 +1227,58 @@ def run_ict_backtest(
                 # Apply tier-driven SL/TP scaling on top of breadth scaling.
                 scaled_sl = scaled_sl * tier_sl_scale
                 scaled_tp = scaled_tp * tier_tp_scale
+                # ── 2026-09-26 (nb56 dual-fire follow-up): honor
+                # ``immediate_sl_mode`` / ``immediate_tp_mode`` on the
+                # ladder path. The signal generator (``ict_signals.py``
+                # lines 2687-2700) emits pre-scaled SL/TP via
+                # ``sl_per_b * zone_width`` etc., but the bar loop's
+                # ``compute_layer_sl_tp`` call OVERWRITES those values
+                # with its own breadth-edge math (zone_anchor_sl ×
+                # breadth_mult, NOT sl_per_b × breadth). This makes
+                # ``immediate_sl_mode='zone_mult'`` and
+                # ``immediate_sl_mode='usd_fixed'`` silent no-ops on
+                # the immediate ladder path — only ``atr_mult`` works
+                # (because it flips _atr_anchor above). We re-apply
+                # the user's mode selector here using the signal's
+                # pre-scaled values when available, so all three modes
+                # are honored. Falls back to the signal's ``stop_usd``
+                # / ``target_usd`` if the signal carried them; falls
+                # back to the legacy ``compute_layer_sl_tp`` output if
+                # the signal didn't carry pre-scaled values.
+                _sig_sl = getattr(sig, "stop_usd", None)
+                _sig_tp = getattr(sig, "target_usd", None)
+                if _imm_sl_mode_v and _sig_sl is not None and float(_sig_sl) > 0:
+                    scaled_sl = float(_sig_sl) * tier_sl_scale
+                if _imm_tp_mode_v2 and _sig_tp is not None and float(_sig_tp) > 0:
+                    scaled_tp = float(_sig_tp) * tier_tp_scale
                 if cv > 1.0 and ms_boost > 1.0:
                     scaled_tp = scaled_tp * (1.0 + (ms_boost - 1.0) * (cv - 1.0) / 0.5)
+                # ── 2026-09-26 (nb57): conviction-aware SL/TP widening.
+                # ``sig.conviction`` (cv) ranges 1.0 (neutral) up to ~1.5
+                # (fresh BoS/CHoCH+ in trade direction). High-conviction
+                # signals get wider SL/TP so they have room to ride the
+                # structural move and let winners run; low-conviction
+                # signals are not penalized. Defaults (widen=1.0) make
+                # a cv=1.5 trade get ``×1.5`` SL/TP. CV floor
+                # (``ladder_min_conviction`` > 0) drops the layer entirely.
+                _cv_floor = float(getattr(p, "ladder_min_conviction", 0.0))
+                _sl_widen = float(getattr(p, "ladder_conviction_sl_widen", 1.0))
+                _tp_widen = float(getattr(p, "ladder_conviction_tp_widen", 1.0))
+                if _cv_floor > 0.0 and cv < _cv_floor:
+                    # Skip this layer entirely — no push to pending_layers.
+                    continue
+                if cv > 1.0:
+                    if _sl_widen > 0.0:
+                        scaled_sl = scaled_sl * (1.0 + (cv - 1.0) * _sl_widen)
+                    if _tp_widen > 0.0:
+                        scaled_tp = scaled_tp * (1.0 + (cv - 1.0) * _tp_widen)
                 pending_layers.append({
                     "layer_idx": li,
                     "offset_usd": off,
                     "fill_price": b_close + off,  # limit price
                     "submit_bar": i,
                     "submit_time_ns": b_time,
-                    "lots": lots_per_layer,
+                    "qty_btc": lots_per_layer,
                     "direction": sig.direction,
                     "stop_usd": scaled_sl,
                     "target_usd": scaled_tp,
@@ -1098,13 +1311,20 @@ def run_ict_backtest(
             sniper_min_zone = float(getattr(p, "fvg_inv_trade_min_zone_usd", 0.30))
             sniper_sl_mult = float(getattr(p, "fvg_inv_trade_sl_zone_mult", 1.0))
             sniper_tp_mult = float(getattr(p, "fvg_inv_trade_tp_zone_mult", 1.8))
-            # ATR-scaled TP option (added 2026-09-17, v7+): when
-            # ``fvg_inv_trade_tp_atr_mult > 0``, TP is computed as
-            # ``ATR_at_entry_bar × atr_mult`` instead of
-            # ``zone_w × zone_mult``. The two knobs are mutually
-            # exclusive — ATR mult wins when > 0.
-            sniper_tp_atr_mult = float(getattr(p, "fvg_inv_trade_tp_atr_mult", 0.0))
-            sniper_use_atr_tp = sniper_tp_atr_mult > 0.0
+            # SL/TP sizing modes (added 2026-09-26 c). Each is either
+            # "zone_mult" (default — preserves v17 SNIPER XAUUSD-tied
+            # behaviour) or "atr_mult" (regime-adaptive). Independent
+            # toggles for SL and TP. ATR mults read from
+            # ``fvg_inv_trade_sl_atr_mult`` (SL) and
+            # ``fvg_inv_trade_tp_atr_mult_v2`` (TP).
+            sniper_sl_mode = str(getattr(p, "sniper_sl_mode", "zone_mult"))
+            sniper_tp_mode = str(getattr(p, "sniper_tp_mode", "zone_mult"))
+            sniper_sl_atr_mult = float(getattr(p, "fvg_inv_trade_sl_atr_mult", 0.25))
+            sniper_tp_atr_mult_v2 = float(getattr(p, "fvg_inv_trade_tp_atr_mult_v2", 0.55))
+            # Legacy back-compat: if the user explicitly set
+            # ``fvg_inv_trade_tp_atr_mult > 0`` AND didn't switch mode,
+            # honour the legacy ATR-TP behaviour.
+            sniper_tp_atr_mult_legacy = float(getattr(p, "fvg_inv_trade_tp_atr_mult", 0.0))
             sniper_max_per = max(1, int(getattr(p, "fvg_inv_trade_max_per_zone", 1)))
             sniper_zone_count: dict[int, int] = {}
             for sp in pending_sniper_layers:
@@ -1148,8 +1368,9 @@ def run_ict_backtest(
                 # True on the inversion bar (causal — known at this
                 # bar). Queue the resulting iFVG trade for next bar's
                 # open via the existing pending_inv_layers path; it
-                # carries entry_triggered_by='sniper' so it is
-                # distinguishable from INV_TRADE entries.
+                # carries entry_triggered_by='sniper_dirty' so it is
+                # distinguishable from clean-path entries
+                # ('ifvg_clean') and INV_TRADE entries ('inv').
                 if getattr(zone, "inverted", False):
                     zone_w = float(zone.zone_high - zone.zone_low)
                     if zone_w < sniper_min_zone:
@@ -1163,44 +1384,220 @@ def run_ict_backtest(
                         n_sniper_cancelled += 1
                         continue
                     sniper_zone_count[zid] = n_so_far + 1
-                    # The entry direction is opposite the signal direction.
-                    # The retest scanner already flips for inverted zones
-                    # (d = -z.direction if z.inverted), so an ifvg signal
-                    # already carries the "trade the inversion" direction.
-                    # Flipping once here gives: fvg signal -> SHORT (correct
-                    # reversal), ifvg signal -> LONG (correct continuation).
-                    # This is the patient sniper: wait for the inversion to
-                    # resolve, then enter in the SAME direction as the
-                    # original FVG. The hypothesis: the inversion was a
-                    # liquidity sweep, the original thesis survives, enter
-                    # on the retest of the now-inverted zone.
+                    # ── Sniper direction on inversion (renamed 2026-09-26) ─
+                    # The scanner's iFVG direction already carries ONE
+                    # flip relative to the original zone polarity:
+                    #   scanner d = -z.direction if z.inverted else z.direction
+                    # The sniper applies a SECOND flip in
+                    # ``-int(sp["direction"])`` to land on the
+                    # continuation side. The canonical v17 BTC SNIPER
+                    # recipe runs the bar loop in
+                    # ``sniper_inv_direction_mode = "continuation"``
+                    # mode, which keeps the second flip — net effect:
+                    # sniper enters in the ORIGINAL FVG gap-polarity
+                    # direction (bull FVG → LONG; bear FVG → SHORT).
+                    #
+                    # The legacy
+                    # ``sniper_inv_direction_mode = "fade_displacement"``
+                    # mode drops the second flip — net effect: sniper
+                    # enters OPPOSITE the original FVG gap polarity
+                    # (bull FVG → SHORT; bear FVG → LONG). This
+                    # matches the live engine's current behaviour in
+                    # the sibling ``ict_sniper_live`` repo; it's
+                    # called out here so anyone reading this code
+                    # understands the divergence with the live
+                    # engine under the canonical recipe. See
+                    # ``AGENTS.md`` § "Sniper direction on inversion"
+                    # for the full divergence table and the planned
+                    # reconciliation.
+                # ── Zone "cleanliness" gate (added 2026-09-26, BTC v17 c) ─
+                # At the moment of inversion, check whether the zone's
+                # mitigation AND inversion events are both "far enough"
+                # from the zone's trigger bar. ``mitigated_bar`` and
+                # ``inverted_bar`` are causal flags set by the detector
+                # — they're known by the bar we reach this branch.
+                #
+                # Interpretation:
+                # * Clean zone (mit ≥ N bars, inv ≥ N bars): the
+                #   mitigation is "organic" (not a 1-tick drive-through)
+                #   AND the inversion is a real structural flip, not a
+                #   SL-hunt probe. Use the iFVG immediate path (next-bar
+                #   open, ATR-anchored SL/TP). NO sniper needed.
+                # * Dirty zone (mit OR inv < N bars): drive-through
+                #   noise / SL-hunt probe. Use the sniper path
+                #   (deferred entry, zone-anchored SL/TP) to wait for a
+                #   confirming close. The sniper queue is the existing
+                #   ``pending_sniper_layers`` — we just stop short of
+                #   firing immediately and let the sniper path run.
+                #
+                # Both paths run on every triggered zone; the routing
+                # decision is per-zone, made at the inversion bar.
+                # Routing-floor override (added 2026-09-26, nb56):
+                # the bar loop honours an explicit routing-only floor
+                # (``fvg_route_min_*_distance_bars``) when set, falling
+                # through to the canonical detector-floor value
+                # (``fvg_min_*_distance_bars``) when None. The detector
+                # itself is unaffected so the SweepCache fingerprint
+                # stays stable across routing-floor sweeps.
+                _route_min_mit = getattr(p, "fvg_route_min_mit_distance_bars", None)
+                _route_min_inv = getattr(p, "fvg_route_min_inv_distance_bars", None)
+                _min_mit_bars = int(_route_min_mit if _route_min_mit is not None
+                                    else getattr(p, "fvg_min_mit_distance_bars", 3))
+                _min_inv_bars = int(_route_min_inv if _route_min_inv is not None
+                                    else getattr(p, "fvg_min_inv_distance_bars", 3))
+                mit_bar_v = int(getattr(zone, "mitigated_bar", -1))
+                inv_bar_v = int(getattr(zone, "inverted_bar", -1))
+                _trigger_bar = int(getattr(zone, "trigger_bar", -1))
+                _mit_dist = (
+                    (mit_bar_v - _trigger_bar)
+                    if (mit_bar_v >= 0 and _trigger_bar >= 0)
+                    else -1
+                )
+                _inv_dist = (
+                    (inv_bar_v - _trigger_bar)
+                    if (inv_bar_v >= 0 and _trigger_bar >= 0)
+                    else -1
+                )
+                _is_clean = (
+                    _mit_dist >= _min_mit_bars
+                    and _inv_dist >= _min_inv_bars
+                )
+                if _is_clean:
+                    # ── Clean path: immediate iFVG entry, ATR-anchored ─
+                    # Drop the sniper; submit the iFVG directly via the
+                    # existing INV_TRADE queue with ATR-anchored SL/TP
+                    # (not zone-width-anchored — the cleaner the zone,
+                    # the more we trust the ATR frame).
                     inv_dir = -int(sp["direction"])
-                    # TP choice: ATR-scaled when ``sniper_tp_atr_mult > 0``,
-                    # otherwise zone-width-scaled. Both are known at
-                    # this bar (ATR via ``atr_arr[i]``, zone_w via the
-                    # zone object) — causal, no look-ahead.
-                    if sniper_use_atr_tp:
-                        atr_v = float(atr_arr[i]) if 0 <= i < atr_arr.shape[0] else 0.0
-                        target_usd_v = atr_v * sniper_tp_atr_mult
+                    if str(getattr(p, "sniper_inv_direction_mode", "continuation")) == "fade_displacement":
+                        inv_dir = -inv_dir
+                    # SL/TP sizing modes (added 2026-09-26 d).
+                    # Independent toggles ``sniper_sl_mode`` /
+                    # ``sniper_tp_mode`` decide zone_mult vs atr_mult
+                    # for each. Default canonical = "zone_mult" for
+                    # both (matches v17 SNIPER XAUUSD-tuned values).
+                    zone_w = float(zone.zone_high - zone.zone_low)
+                    sniper_sl_mode_local = str(getattr(p, "sniper_sl_mode", "zone_mult"))
+                    sniper_tp_mode_local = str(getattr(p, "sniper_tp_mode", "zone_mult"))
+                    sniper_sl_mult_local = float(getattr(p, "fvg_inv_trade_sl_zone_mult", 5.0))
+                    sniper_tp_mult_local = float(getattr(p, "fvg_inv_trade_tp_zone_mult", 22.0))
+                    sniper_sl_atr_local = float(getattr(p, "fvg_inv_trade_sl_atr_mult", 0.25))
+                    sniper_tp_atr_v2_local = float(getattr(p, "fvg_inv_trade_tp_atr_mult_v2", 0.55))
+                    sniper_tp_atr_legacy_local = float(getattr(p, "fvg_inv_trade_tp_atr_mult", 0.0))
+                    _atr_v = float(
+                        atr_arr[i] if 0 <= i < atr_arr.shape[0] else 0.0
+                    )
+                    # Sniper SL/TP mode (added 2026-09-26 d).
+                    # Three regimes: "zone_mult" (default), "atr_mult",
+                    # "usd_fixed" — parallel to the immediate-mode
+                    # selector. ``usd_fixed`` pins SL/TP to
+                    # ``sl_usd`` / ``tp_usd`` regardless of zone width
+                    # or ATR — useful for "wide zone can't reach TP"
+                    # experiments the user asked for.
+                    sniper_sl_usd_local = float(getattr(p, "sl_usd", 20.0))
+                    sniper_tp_usd_local = float(getattr(p, "tp_usd", 200.0))
+                    if sniper_sl_mode_local == "atr_mult":
+                        stop_usd_v = _atr_v * sniper_sl_atr_local
+                    elif sniper_sl_mode_local == "usd_fixed":
+                        stop_usd_v = sniper_sl_usd_local
                     else:
-                        target_usd_v = zone_w * sniper_tp_mult
+                        stop_usd_v = zone_w * sniper_sl_mult_local
+                    if sniper_tp_atr_legacy_local > 0.0 and sniper_tp_mode_local == "zone_mult":
+                        target_usd_v = _atr_v * sniper_tp_atr_legacy_local
+                    elif sniper_tp_mode_local == "atr_mult":
+                        target_usd_v = _atr_v * sniper_tp_atr_v2_local
+                    elif sniper_tp_mode_local == "usd_fixed":
+                        target_usd_v = sniper_tp_usd_local
+                    else:
+                        target_usd_v = zone_w * sniper_tp_mult_local
                     pending_inv_layers.append({
                         "submit_bar": i + 1,
                         "submit_time_ns": int(times_ns[i + 1]) if i + 1 < n else b_time,
                         "direction": inv_dir,
-                        "stop_usd": zone_w * sniper_sl_mult,
+                        "stop_usd": stop_usd_v,
                         "target_usd": target_usd_v,
-                        "lots": float(p.lots),
+                        "qty_btc": float(getattr(p, "qty_btc", 0.001)),
                         "fvg_zone": zone,
                         "is_ifvg": True,
                         "tp_rule": 1,
                         "rank_tier": "",
                         "rank_percentile": 0.0,
-                        "entry_triggered_by": "sniper",
+                        "entry_triggered_by": "ifvg_clean",
                     })
                     ict_series.n_inv_trades_submitted += 1
                     n_sniper_triggered += 1
+                    n_ifvg_clean_emitted += 1
                     continue
+                # ── Dirty path: deferred sniper entry (legacy v17 b) ──
+                # Replace the existing immediate-fire logic with the
+                # sniper's deferred-entry path. The sniper waits for a
+                # confirming close before submitting the iFVG trade.
+                # Implemented as: leave the sniper in the pending list
+                # and DON'T fire ``pending_inv_layers`` yet. The sniper
+                # continues to wait for ``zone.inverted == True`` (it
+                # is) AND for a confirming close on the inverted side.
+                # The confirming-close check is added below.
+                #
+                # NOTE: the existing sniper logic fires on
+                # ``zone.inverted == True`` regardless of confirming
+                # close. We honour the legacy fire semantics here
+                # (sniper fires on inversion), but tag the entry as
+                # ``entry_triggered_by="sniper_dirty"`` so the
+                # downstream analysis can split the clean vs dirty
+                # buckets.
+                inv_dir = -int(sp["direction"])
+                if str(getattr(p, "sniper_inv_direction_mode", "continuation")) == "fade_displacement":
+                    inv_dir = -inv_dir
+                # SL/TP choice (2026-09-26 c): independent toggles
+                # ``sniper_sl_mode`` / ``sniper_tp_mode`` decide zone_mult
+                # vs atr_mult for each. Legacy
+                # ``fvg_inv_trade_tp_atr_mult > 0`` still works: it
+                # promotes TP to atr_mult unless the user already opted
+                # into zone_mult explicitly.
+                atr_v = float(atr_arr[i]) if 0 <= i < atr_arr.shape[0] else 0.0
+                # Sniper SL/TP mode (added 2026-09-26 d).
+                # Three regimes: zone_mult (default), atr_mult, usd_fixed.
+                sniper_sl_usd_d = float(getattr(p, "sl_usd", 20.0))
+                sniper_tp_usd_d = float(getattr(p, "tp_usd", 200.0))
+                if sniper_sl_mode == "atr_mult":
+                    stop_usd_v = atr_v * sniper_sl_atr_mult
+                elif sniper_sl_mode == "usd_fixed":
+                    stop_usd_v = sniper_sl_usd_d
+                else:
+                    stop_usd_v = zone_w * sniper_sl_mult
+                if sniper_tp_atr_mult_legacy > 0.0 and sniper_tp_mode == "zone_mult":
+                    # Legacy ATR-TP path is honoured when present.
+                    target_usd_v = atr_v * sniper_tp_atr_mult_legacy
+                elif sniper_tp_mode == "atr_mult":
+                    target_usd_v = atr_v * sniper_tp_atr_mult_v2
+                elif sniper_tp_mode == "usd_fixed":
+                    target_usd_v = sniper_tp_usd_d
+                else:
+                    target_usd_v = zone_w * sniper_tp_mult
+                pending_inv_layers.append({
+                    "submit_bar": i + 1,
+                    "submit_time_ns": int(times_ns[i + 1]) if i + 1 < n else b_time,
+                    "direction": inv_dir,
+                    "stop_usd": stop_usd_v,
+                    "target_usd": target_usd_v,
+                    "qty_btc": float(getattr(p, "qty_btc", 0.001)),
+                    "fvg_zone": zone,
+                    "is_ifvg": True,
+                    "tp_rule": 1,
+                    "rank_tier": "",
+                    "rank_percentile": 0.0,
+                    # 2026-09-26 nb56: tag dirty-path sniper entries as
+                    # ``"sniper_dirty"`` so downstream analysis (e.g.
+                    # ``nb56_combined_sniper_immediate``) can split
+                    # clean-path iFVG (``"ifvg_clean"``) from
+                    # sniper-path (``"sniper_dirty"``) buckets. Previously
+                    # both paths were tagged ``"sniper"`` and the
+                    # per-bucket PnL split was unobservable.
+                    "entry_triggered_by": "sniper_dirty",
+                })
+                ict_series.n_inv_trades_submitted += 1
+                n_sniper_triggered += 1
+                continue
                 # Default: still waiting for inversion.
                 still_sniper.append(sp)
             pending_sniper_layers = still_sniper
@@ -1458,18 +1855,57 @@ def run_ict_backtest(
                             ot["inv_trade_emitted"] = True
                             zone_w = float(zone.zone_high - zone.zone_low)
                             inv_dir = -tr.direction   # opposite of original
-                            # TP choice: ATR-scaled when the ATR mult
-                            # knob is > 0 (added 2026-09-17). The two
-                            # knobs are mutually exclusive.
+                            # ── Immediate-mode SL mode selector (added 2026-09-26 d) ──
+                            # Resolves SL for the inverse (iFVG) trade via
+                            # one of three regimes: zone_mult (default =
+                            # legacy ``fvg_inv_trade_sl_zone_mult``),
+                            # atr_mult, or usd_fixed.
+                            _imm_sl_mode_v = str(getattr(p, "immediate_sl_mode", "") or "")
+                            _atr_v_iv = float(
+                                atr_arr[i]
+                                if 0 <= i < atr_arr.shape[0] else 0.0
+                            )
+                            _imm_sl_zone_v = float(
+                                getattr(p, "immediate_sl_zone_mult", 0.0)
+                            )
+                            if _imm_sl_mode_v == "atr_mult":
+                                _sl_atr_v = float(getattr(p, "sl_atr_mult", 0.25))
+                                stop_usd_v = _atr_v_iv * _sl_atr_v
+                            elif _imm_sl_mode_v == "usd_fixed":
+                                stop_usd_v = float(getattr(p, "sl_usd", 20.0))
+                            elif _imm_sl_mode_v == "zone_mult" and _imm_sl_zone_v > 0:
+                                stop_usd_v = zone_w * _imm_sl_zone_v
+                            else:
+                                stop_usd_v = zone_w * inv_sl_mult
+                            # ── Immediate-mode TP mode selector (added 2026-09-26 d) ──
+                            # Parallel to sniper_tp_mode. Resolves TP for
+                            # the inverse (iFVG) trade via one of three
+                            # regimes: zone_mult (default = legacy
+                            # ``fvg_inv_trade_tp_zone_mult``), atr_mult,
+                            # or usd_fixed. SL is always zone-anchored
+                            # (zone_w * inv_sl_mult) — the iFVG path is
+                            # structurally tied to the inverted zone.
+                            _imm_tp_mode_v = str(getattr(p, "immediate_tp_mode", "") or "")
                             _inv_tp_atr_mult = float(
                                 getattr(p, "fvg_inv_trade_tp_atr_mult", 0.0)
                             )
-                            if _inv_tp_atr_mult > 0.0:
-                                _atr_v = float(
-                                    atr_arr[i]
-                                    if 0 <= i < atr_arr.shape[0] else 0.0
-                                )
-                                target_usd_v = _atr_v * _inv_tp_atr_mult
+                            _imm_tp_zone_v = float(
+                                getattr(p, "immediate_tp_zone_mult", 0.0)
+                            )
+                            if _imm_tp_mode_v == "atr_mult":
+                                _tp_atr_v = float(getattr(p, "tp_atr_mult", 0.55))
+                                target_usd_v = _atr_v_iv * _tp_atr_v
+                            elif _imm_tp_mode_v == "usd_fixed":
+                                target_usd_v = float(getattr(p, "tp_usd", 200.0))
+                            elif _imm_tp_mode_v == "zone_mult" and _imm_tp_zone_v > 0:
+                                # New mode override — when explicitly
+                                # opting into immediate_tp_mode=zone_mult,
+                                # the per-trade TP comes from the new
+                                # immediate_tp_zone_mult knob, NOT the
+                                # legacy fvg_inv_trade_tp_zone_mult.
+                                target_usd_v = zone_w * _imm_tp_zone_v
+                            elif _inv_tp_atr_mult > 0.0:
+                                target_usd_v = _atr_v_iv * _inv_tp_atr_mult
                             else:
                                 target_usd_v = zone_w * inv_tp_mult
                             # Queue the inverse trade for the NEXT bar
@@ -1481,9 +1917,9 @@ def run_ict_backtest(
                                 "submit_bar": i + 1,
                                 "submit_time_ns": int(times_ns[i + 1]) if i + 1 < n else b_time,
                                 "direction": inv_dir,
-                                "stop_usd": zone_w * inv_sl_mult,
+                                "stop_usd": stop_usd_v,
                                 "target_usd": target_usd_v,
-                                "lots": float(p.lots),
+                                "qty_btc": float(getattr(p, "qty_btc", 0.001)),
                                 "fvg_zone": zone,
                                 "is_ifvg": True,  # the entry is conceptually an iFVG (entered against the original)
                                 "tp_rule": 1,
@@ -1773,7 +2209,7 @@ def _open_trade(layer: dict, ep: float, bar: int, b_time: int, p: TrendStrategyP
         hold_secs=0.0,
         pnl_usd=0.0,
         entry_triggered_by=layer.get("triggered_by") or layer.get("entry_triggered_by", "fvg"),
-        lots=layer["lots"],
+        lots=layer.get("qty_btc", layer.get("lots", 0.001)),
         layer_idx=layer.get("layer_idx", 0),
         n_layers_signal=p.num_layers,
         signal_id=layer.get("signal_id", -1),
@@ -1797,32 +2233,27 @@ def _close_trade(
     tr.exit_reason = reason
     if tr.entry_time > 0:
         tr.hold_secs = (b_time - tr.entry_time) / 1e9
-    # PnL = signed price move × lots × contract_size
-    # Default contract_size=100.0 = XAUUSD (1 lot = 100 oz, $1 move = $100/lot).
-    # For BTC Binance perps the canonical config sets contract_size=1.0
-    # so 1 lot × $1 move = $1 PnL (1 contract = 1 BTC).
-    contract_size = float(getattr(p, "contract_size", 100.0))
+    # ── BTC-native PnL (2026-09-26 refactor) ─────────────────
+    # PnL = signed price move × qty_btc. No contract multiplier
+    # on Binance USDT-M perps. ``tr.lots`` is kept as a back-compat
+    # alias of ``tr.qty_btc`` for old callers.
+    qty_btc = float(getattr(p, "qty_btc", getattr(p, "lots", 0.001)))
+    tr.qty_btc = qty_btc  # canonical field; mirror on the trade
     if tr.direction > 0:
-        tr.pnl_usd = (tr.exit_price - tr.entry_price) * tr.lots * contract_size
+        tr.pnl_usd = (tr.exit_price - tr.entry_price) * qty_btc
     else:
-        tr.pnl_usd = (tr.entry_price - tr.exit_price) * tr.lots * contract_size
+        tr.pnl_usd = (tr.entry_price - tr.exit_price) * qty_btc
 
     # ── Binance fee debit (added 2026-09-24, BTC fork) ─────────────
-    # USDT-M perpetual: taker 0.04% / maker 0.02% per side (BNB
-    # discount path: 0.039% / 0.019%). Market-order entries + exits
-    # (sniper path) use the TAKER rate. Fee is debited as NOTIONAL ×
-    # bps on ENTRY and on EXIT (so 2 sides × 5 bps = 10 bps round-trip
-    # at the default).
-    #
-    # For symmetric notional we charge on the ENTRY price (the
-    # position size is fixed at entry); the exit is a flat taker fee
-    # at the closing notional — practically equal for the small R:R
-    # ranges of this strategy.
+    # USDT-M perpetual: taker 0.04% / maker 0.02% per side. Market-
+    # order entries + exits use the TAKER rate. Fee is debited as
+    # NOTIONAL × bps on ENTRY and on EXIT (so 2 sides × 5 bps = 10
+    # bps round-trip at the default).
     taker_bps = float(getattr(p, "taker_fee_bps", 0.0))
-    if taker_bps > 0.0 and tr.lots > 0 and contract_size > 0:
+    if taker_bps > 0.0 and qty_btc > 0:
         # Notional at entry (the fixed position size). Round-trip =
         # 2 sides × taker rate.
-        notional_usd = abs(tr.entry_price) * tr.lots * contract_size
+        notional_usd = abs(tr.entry_price) * qty_btc
         tr.fee_usd = notional_usd * (taker_bps / 10_000.0) * 2.0
         tr.taker_bps_charged = taker_bps
         tr.pnl_usd -= tr.fee_usd

@@ -1,0 +1,89 @@
+{
+  "n_bars": 28567,
+  "n_trades": 9,
+  "total_pnl_usd": 1.3531599999997852,
+  "wall_secs": 0.08534717559814453,
+  "trades": [
+    {
+      "direction": 1,
+      "entry_time_utc": "01:56:30",
+      "entry_price": 84470.0,
+      "exit_price": 84462.68,
+      "exit_reason": "inv",
+      "pnl_usd": -0.007320000000006985,
+      "stop_usd": 20.20000000001164
+    },
+    {
+      "direction": -1,
+      "entry_time_utc": "02:17:18",
+      "entry_price": 84811.4,
+      "exit_price": 84817.62000000001,
+      "exit_reason": "inv",
+      "pnl_usd": -0.006220000000015716,
+      "stop_usd": 25.20000000001164
+    },
+    {
+      "direction": -1,
+      "entry_time_utc": "02:32:28",
+      "entry_price": 84668.3,
+      "exit_price": 84182.29999999994,
+      "exit_reason": "tp",
+      "pnl_usd": 0.4860000000000582,
+      "stop_usd": 48.60000000000582
+    },
+    {
+      "direction": -1,
+      "entry_time_utc": "06:47:14",
+      "entry_price": 84015.7,
+      "exit_price": 83703.70000000017,
+      "exit_reason": "tp",
+      "pnl_usd": 0.31199999999982536,
+      "stop_usd": 31.199999999982538
+    },
+    {
+      "direction": 1,
+      "entry_time_utc": "07:54:16",
+      "entry_price": 83948.9,
+      "exit_price": 83937.29999999999,
+      "exit_reason": "sl",
+      "pnl_usd": -0.011600000000005821,
+      "stop_usd": 11.60000000000582
+    },
+    {
+      "direction": 1,
+      "entry_time_utc": "08:07:27",
+      "entry_price": 84003.3,
+      "exit_price": 83980.7,
+      "exit_reason": "sl",
+      "pnl_usd": -0.02260000000000582,
+      "stop_usd": 22.60000000000582
+    },
+    {
+      "direction": 1,
+      "entry_time_utc": "08:08:31",
+      "entry_price": 84045.6,
+      "exit_price": 84319.59999999995,
+      "exit_reason": "tp",
+      "pnl_usd": 0.2739999999999418,
+      "stop_usd": 27.39999999999418
+    },
+    {
+      "direction": 1,
+      "entry_time_utc": "08:11:32",
+      "entry_price": 84069.4,
+      "exit_price": 84339.4,
+      "exit_reason": "tp",
+      "pnl_usd": 0.27,
+      "stop_usd": 27.0
+    },
+    {
+      "direction": -1,
+      "entry_time_utc": "08:28:35",
+      "entry_price": 84427.4,
+      "exit_price": 84368.5,
+      "exit_reason": "eod",
+      "pnl_usd": 0.05889999999999418,
+      "stop_usd": 25.39999999999418
+    }
+  ]
+}
